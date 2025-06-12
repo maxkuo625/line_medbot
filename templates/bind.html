@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>綁定邀請碼</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+</head>
+<body>
+  <h2>綁定邀請中...</h2>
+  <div id="result"></div>
+
+  <script>
+    async function main() {
+      await liff.init({ liffId: "2007541587-XzE0k170" });
+
+      if (!liff.isLoggedIn()) {
+        liff.login();
+        return;
+      }
+
+      const profile = await liff.getProfile();
+      const userId = profile.userId;
+      const urlParams = new URLSearchParams(window.location.search);
+      const inviteCode = urlParams.get("code");
+
+      if (!inviteCode) {
+        document.getElementById("result").innerText = "❌ 缺少邀請碼";
+        return;
+      }
+
+      const response = await fetch("/liff-bind", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_user_id: userId, invite_code: inviteCode })
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        document.getElementById("result").innerText = "✅ 綁定成功！";
+
+        // 發送訊息
+        if (liff.isInClient()) {
+          await liff.sendMessages([
+            {
+              type: "text",
+              text: "✅ 綁定成功！您可以輸入「我的藥單」開始查詢"
+            }
+          ]);
+        }
+
+        setTimeout(() => liff.closeWindow(), 1500);
+      } else {
+        document.getElementById("result").innerText = "❌ 邀請碼錯誤或已使用";
+        setTimeout(() => liff.closeWindow(), 2000);
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
