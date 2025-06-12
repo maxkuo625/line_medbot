@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+
+# Flask env files
+.env
+*.env
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Test & coverage
+htmlcov/
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+
+# mypy / type hints
+.mypy_cache/
+.dmypy.json
