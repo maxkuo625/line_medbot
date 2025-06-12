@@ -1,42 +1,59 @@
-# Byte-compiled / optimized / DLL files
+# ===== Python general =====
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
 
-# C extensions
-*.so
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-.eggs/
-
-# Virtual environment
+# Virtual environment folders
 venv/
 .venv/
-ENV/
 env/
-env.bak/
+ENV/
 
-# Flask env files
-.env
-*.env
+# Pipenv
+Pipfile.lock
 
-# Logs
-*.log
+# Poetry
+poetry.lock
 
-# IDEs
-.vscode/
-.idea/
+# PyInstaller
+*.spec
+dist/
+build/
 
-# Test & coverage
+# Byte-compiled / optimized / DLL files
+*.so
+*.dll
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Unit test / coverage
 htmlcov/
 .coverage
 .tox/
 .nox/
 .pytest_cache/
 
-# mypy / type hints
+# Flask / environment
+.env
+*.env
+instance/
+*.db
+*.sqlite3
+
+# MyPy / Pyright / type checking
 .mypy_cache/
-.dmypy.json
+.pytype/
+dmypy.json
+
+# VSCode / PyCharm IDE settings
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# macOS / Windows junk
+.DS_Store
+Thumbs.db
