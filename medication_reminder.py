@@ -1,4 +1,8 @@
-import datetime
+from datetime import datetime
+import re
+import json
+from urllib.parse import quote, parse_qs
+
 from database import get_conn
 from linebot.models import (
     TextSendMessage, QuickReply, QuickReplyButton,
@@ -8,11 +12,20 @@ from linebot.exceptions import LineBotApiError
 from models import (
     get_all_family_user_ids, get_medicine_list,
     get_temp_state, set_temp_state, clear_temp_state,
-    add_medication_reminder, delete_medication_reminder, get_medication_reminders_for_user
+    delete_medication_reminder_time,
+    get_medication_reminders_for_user,
+    get_medicine_id_by_name,
+    add_medication_record,
+    get_frequency_name,
+    add_medication_reminder_full,
+    create_user_if_not_exists # Make sure this is imported if used
 )
+import logging # For logging
+
+logging.basicConfig(level=logging.INFO)
 
 # -------------------------------------------------------------
-# 定義劑量 Quick Reply 選項
+# 定義劑量 Quick Reply 選項 (Existing code)
 # -------------------------------------------------------------
 DOSAGE_OPTIONS = [
     {'label': '1 錠', 'data': '1 錠'},
@@ -21,399 +34,807 @@ DOSAGE_OPTIONS = [
     {'label': '5 毫升(ml)', 'data': '5 ml'},
     {'label': '1 包', 'data': '1 包'},
     {'label': '半顆', 'data': '半顆'},
-    {'label': '2 錠', 'data': '2 錠'},
-    {'label': '其他', 'data': '其他劑量'} # 讓用戶輸入的選項
+    {'label': '2 錠', 'data': '2 錠'}, # Added this based on common dosages
+    {'label': '其他', 'data': '其他'}
 ]
 
-# -------------------------------------------------------------
-# 定時提醒函式 (run_reminders 修改為合併訊息)
-# -------------------------------------------------------------
+# ------------------------------------------------------------
+# 執行用藥提醒
+# ------------------------------------------------------------
 def run_reminders(line_bot_api):
-    now = datetime.datetime.now().strftime('%H:%M')
-    print(f"DEBUG: Checking reminders for time: {now}")
-
+    logging.info(f"正在執行提醒任務，當前時間: {datetime.now().strftime('%H:%M')}")
     conn = get_conn()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(
+    if not conn:
+        logging.error("無法連接到資料庫，跳過提醒任務。")
+        return
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        current_time_str = datetime.now().strftime('%H:%M:%S')
+
+        query = """
+        SELECT
+            rt.recorder_id AS line_user_id,
+            rt.member,
+            fc.frequency_name,
+            mr.dose_quantity,
+            mr.dosage_unit,
+            di.drug_name_zh AS medicine_name
+        FROM
+            reminder_time rt
+        JOIN
+            medication_record mr ON rt.recorder_id = mr.recorder_id
+                               AND rt.member = mr.member
+                               AND rt.frequency_name = mr.frequency_name
+        LEFT JOIN drug_info di ON mr.drug_name_zh = di.drug_name_zh
+        JOIN
+            frequency_code fc ON rt.frequency_name = fc.frequency_name
+        WHERE
+            TIME(%s) IN (
+                TIME(rt.time_slot_1),
+                TIME(rt.time_slot_2),
+                TIME(rt.time_slot_3),
+                TIME(rt.time_slot_4)
+            );
         """
-        SELECT um.user_id, m.name AS medicine_name, um.dosage, um.frequency
-        FROM user_medication um
-        JOIN medicines m ON um.medicine_id = m.id
-        WHERE um.time_str = %s
-        """,
-        (now,)
-    )
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
+        cursor.execute(query, (current_time_str,))
+        reminders_to_send = cursor.fetchall()
+        cursor.execute(query, (current_time_str,))
+        reminders_to_send = cursor.fetchall()
 
-    # 建立一個字典來按 user_id 分組提醒
-    reminders_by_user = {}
-    for row in results:
-        owner_id = row["user_id"]
-        if owner_id not in reminders_by_user:
-            reminders_by_user[owner_id] = []
-        reminders_by_user[owner_id].append({
-            'medicine_name': row["medicine_name"],
-            'dosage': row.get("dosage", "未指定劑量"),
-            'frequency': row.get("frequency", "未指定頻率")
-        })
+        if reminders_to_send:
+            logging.info(f"找到 {len(reminders_to_send)} 個提醒需要發送。")
+            for reminder in reminders_to_send:
+                line_user_id = reminder['line_user_id']
+                member = reminder['member']
+                medicine_name = reminder['medicine_name'] # 現在直接是 name_zh
+                dose_quantity = reminder.get('dose_quantity', '未設定') # 從 SQL 結果獲取，如果為 NULL 則為 '未設定'
+                dosage_unit = reminder.get('dosage_unit', '')
+                frequency_name = reminder.get('frequency_name', '未設定頻率') # 如果 frequency_name 為 NULL，則顯示 '未設定頻率'
 
-    notified_overall = set() # 用於追蹤哪些用戶已經被通知過，避免重複
+                display_time = datetime.now().strftime('%H:%M')
 
-    for owner_id, meds_to_take in reminders_by_user.items():
-        all_family_user_ids = get_all_family_user_ids(owner_id)
-        
-        try:
-            profile = line_bot_api.get_profile(owner_id)
-            owner_name = profile.display_name
-        except LineBotApiError as e:
-            print(f"ERROR: Could not get profile for {owner_id}: {e}")
-            owner_name = "家人"
-
-        # 構建合併後的訊息
-        med_list_str = []
-        for med in meds_to_take:
-            med_list_str.append(
-                f"- {med['medicine_name']} (劑量: {med['dosage']})"
-            )
-        
-        # 這是給擁有者自己的訊息
-        owner_msg = (
-            f"⏰ 用藥提醒：現在是 {now}，請記得服用以下藥品：\n" +
-            "\n".join(med_list_str)
-        )
-        
-        # 這是給家庭成員的訊息
-        family_msg = (
-            f"⏰ {owner_name} 的用藥提醒：現在是 {now}，請記得提醒對方服用以下藥品：\n" +
-            "\n".join(med_list_str)
-        )
-
-        for uid in all_family_user_ids:
-            if uid in notified_overall:
-                print(f"DEBUG: Skipping already notified UID: {uid} in family {owner_id}'s reminder.")
-                continue
-            
-            msg_to_send = ""
-            if uid == owner_id:
-                msg_to_send = owner_msg
-            else:
-                msg_to_send = family_msg
-            
-            print(f"DEBUG: Attempting to push combined message to UID: {uid} for owner {owner_id}: {msg_to_send}")
-            try:
-                line_bot_api.push_message(uid, TextSendMessage(text=msg_to_send))
-                notified_overall.add(uid) # 將已通知的用戶加入集合
-                print(f"DEBUG: Successfully pushed combined message to {uid}")
-            except Exception as e:
-                print(f"ERROR: Failed to push combined message to {uid}: {e}")
-
-
-# -------------------------------------------------------------
-# 處理文字訊息 (handle_medication_command)
-# -------------------------------------------------------------
-def handle_medication_command(event, line_bot_api):
-    user_id = event.source.user_id
-    text = ""
-    if hasattr(event.message, "text"):
-        text = event.message.text.strip()
-
-    temp_state = get_temp_state(user_id)
-    print(f"DEBUG(handle_medication_command): User: {user_id}, Text: '{text}', Temp State: {temp_state}")
-
-    # 處理多步驟流程中的文字輸入 (其他劑量)
-    if temp_state and temp_state.get('state') == 'awaiting_custom_dosage':
-        # 用戶輸入了自定義劑量
-        temp_state['dosage'] = text
-        # 更新狀態為等待時間選擇
-        temp_state['state'] = 'selecting_time'
-        set_temp_state(user_id, temp_state)
-        # 進入選擇時間的步驟
-        medicine_name = temp_state.get('medicine_name', '未知藥品')
-        dosage = temp_state.get('dosage')
-        send_time_selection(user_id, event.reply_token, line_bot_api, medicine_name, dosage, initial_message=True)
-        return True
-    
-    # 處理完成用藥時間設定的文字指令
-    if text == "完成用藥時間設定" and temp_state and temp_state.get('state') == 'selecting_time':
-        clear_temp_state(user_id)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 已完成所有用藥提醒設定。"))
-        return True
-
-    # 處理其他多步驟的引導訊息
-    elif temp_state and temp_state.get('state') == 'selecting_medicine' and text not in ["用藥時間設定", "新增用藥提醒", "查詢用藥時間", "刪除用藥時間"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請從下方選擇藥品。"))
-        return True
-    elif temp_state and temp_state.get('state') == 'selecting_dosage' and text not in ["用藥時間設定", "新增用藥提醒", "查詢用藥時間", "刪除用藥時間"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請從下方選擇劑量。"))
-        return True
-    elif temp_state and temp_state.get('state') == 'selecting_time' and text not in ["用藥時間設定", "新增用藥提醒", "查詢用藥時間", "刪除用藥時間", "完成用藥時間設定"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請選擇用藥時間或點擊「完成設定」。"))
-        return True
-
-
-    # ✅ 主選單：用藥時間設定
-    if text == "用藥時間設定":
-        clear_temp_state(user_id)
-        message = TextSendMessage(
-            text="請選擇您的操作：",
-            quick_reply=QuickReply(
-                items=[
-                    QuickReplyButton(action=MessageAction(label="新增用藥提醒", text="新增用藥提醒")),
-                    QuickReplyButton(action=MessageAction(label="查詢用藥時間", text="查詢用藥時間")),
-                    QuickReplyButton(action=MessageAction(label="刪除用藥時間", text="刪除用藥時間"))
-                ]
-            )
-        )
-        line_bot_api.reply_message(event.reply_token, message)
-        return True
-
-    # ✅ 新增用藥提醒 - 步驟1: 選擇藥品
-    if text == "新增用藥提醒":
-        medicines = get_medicine_list()
-        if not medicines:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="目前沒有可設定的藥品。"))
-            return True
-
-        buttons = [
-            QuickReplyButton(
-                action=PostbackAction(
-                    label=med['name'],
-                    data=f"action=select_medicine&medicine_id={med['id']}&medicine_name={med['name']}"
+                message_text = (
+                    f"🔔 用藥時間到囉！\n"
+                    f"👤 用藥者：{member}\n"
+                    f"💊 藥品：{medicine_name}\n"
+                    f"⏰ 頻率：{frequency_name}\n"
+                    f"💊 劑量：{dose_quantity}{dosage_unit}\n" # 如果能獲取到劑量再顯示
+                    f"⏰ 時間：{display_time}\n"
+                    f"請記得按時服用喔！"
                 )
-            )
-            for med in medicines
-        ]
-        set_temp_state(user_id, {'state': 'selecting_medicine'})
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text="請選擇您要設定提醒的藥品：",
-                quick_reply=QuickReply(items=buttons[:13])
-            )
-        )
-        return True
-
-    # ✅ 查詢用藥時間
-    if text == "查詢用藥時間":
-        clear_temp_state(user_id)
-        reminders = get_medication_reminders_for_user(user_id) 
-        if reminders:
-            reply_lines = ["📋 您已設定的用藥提醒有："]
-            for item in reminders:
-                dosage_info = f"劑量：{item.get('dosage', '未指定')}" if item.get('dosage') else ""
-                frequency_info = f"頻率：{item.get('frequency', '未指定')}" if item.get('frequency') else ""
-                
-                detail_info = []
-                if dosage_info: detail_info.append(dosage_info)
-                if frequency_info: detail_info.append(frequency_info)
-                
-                details_str = ", ".join(detail_info) if detail_info else "無額外資訊"
-
-                reply_lines.append(f"- {item['time_str']}：{item['medicine_name']} ({details_str})")
-            reply = "\n".join(reply_lines)
+                try:
+                    line_bot_api.push_message(
+                        line_user_id,
+                        TextSendMessage(text=message_text)
+                    )
+                    logging.info(f"已向 {member} ({line_user_id}) 發送提醒：{medicine_name} at {display_time}")
+                except LineBotApiError as e:
+                    logging.error(f"發送提醒給 {line_user_id} 失敗: {e}")
         else:
-            reply = "❗ 尚未設定任何用藥提醒，請輸入「新增用藥提醒」。"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return True
+            logging.info("目前沒有需要發送的提醒。")
 
-    # ✅ 刪除用藥時間
-    if text == "刪除用藥時間":
-        clear_temp_state(user_id)
-        reminders = get_medication_reminders_for_user(user_id)
-        if not reminders:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 沒有可刪除的用藥提醒。"))
-            return True
+    except Exception as e:
+        logging.error(f"執行提醒任務時發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
 
-        buttons = []
-        for item in reminders:
-            # --- 【修正】 縮短 label 長度以符合 Line API 限制 (20 字元) ---
-            display_medicine_name = item['medicine_name']
-            # HH:MM - (8字元) + "..." (3字元) = 11字元
-            # 剩餘 9 字元給藥品名稱
-            if len(display_medicine_name) > 9:
-                display_medicine_name = display_medicine_name[:9] + "..."
+
+# ------------------------------------------------------------
+# 用藥者管理相關功能
+# ------------------------------------------------------------
+
+def create_patient_selection_message(line_id: str):
+    conn = get_conn()
+    if not conn:
+        return TextSendMessage(text="抱歉，無法連接到使用者資料庫。")
+    items = []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            cursor.execute("INSERT INTO users (recorder_id, user_name) VALUES (%s, %s)", (line_id, "新用戶"))
+            conn.commit()
+            current_recorder_id = line_id # 直接使用 line_id 作為 recorder_id
             
-            label = f"{item['time_str']} - {display_medicine_name}"
-            # -------------------------------------------------------------
+            # 插入 patients 表時，使用 recorder_id 作為 line_id
+            cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
+            conn.commit()
+            existing_patients = [{'member': '本人'}]
+        else:
+            # 從 existing user 字典中獲取 recorder_id
+            current_recorder_id = user['recorder_id'] 
             
-            # 傳遞完整的資訊以便精確刪除
-            buttons.append(
+            # 查詢 patients 表時，使用 recorder_id
+            cursor.execute("SELECT member FROM patients WHERE recorder_id = %s", (current_recorder_id,)) # 移除了 ORDER BY patient_id，因為 patients 表沒有 patient_id 欄位
+            existing_patients = cursor.fetchall()
+            
+            # 如果沒有現有用藥者，新增「本人」，使用 recorder_id
+            if not existing_patients:
+                cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
+                conn.commit()
+                existing_patients = [{'member': '本人'}]
+
+        for patient in existing_patients:
+            items.append(
                 QuickReplyButton(
                     action=PostbackAction(
-                        label=label,
-                        data=f"action=delete_reminder&time={item['time_str']}&medicine_id={item['medicine_id']}"
+                        label=patient['member'],
+                        data=f"action=select_patient_for_reminder&member={patient['member']}",
+                        display_text=f"為「{patient['member']}」分析"
                     )
                 )
             )
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text="請選擇要刪除的用藥提醒：",
-                quick_reply=QuickReply(items=buttons[:13])
+        if len(existing_patients) < 4:
+            items.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label="⊕ 新增家人",
+                        data="action=add_new_patient",
+                        display_text="新增家人"
+                    )
+                )
+            )
+    except Exception as e:
+        logging.error(f"Error in create_patient_selection_message: {e}")
+        import traceback
+        traceback.print_exc()
+        return TextSendMessage(text="抱歉，在讀取用藥者資訊時發生錯誤。")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+    return TextSendMessage(text="請問這份藥單是給誰的？", quick_reply=QuickReply(items=items))
+
+def create_medication_management_menu(line_id: str):
+    items = [
+        QuickReplyButton(
+            action=PostbackAction(
+                label="選擇家人/照顧對象",
+                data="action=select_patient_for_reminder_initial", # New action to go to selection menu
+                display_text="選擇用藥對象"
+            )
+        ),
+        QuickReplyButton(
+            action=PostbackAction(
+                label="修改家人名稱",
+                data="action=show_patient_edit_menu",
+                display_text="修改家人名稱"
             )
         )
-        return True
-    return False
+    ]
 
-# -------------------------------------------------------------
-# 處理 Postback 事件 (handle_postback) - 調整邏輯以適應新步驟
-# -------------------------------------------------------------
-def handle_postback(event, line_bot_api):
-    user_id = event.source.user_id
-    data = event.postback.data
-    temp_state = get_temp_state(user_id)
-    print(f"DEBUG(handle_postback): User: {user_id}, Data: '{data}', Temp State: {temp_state}")
+    conn = get_conn()
+    if conn:
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_id,))
+            user = cursor.fetchone()
+            if user:
+                recorder_id_for_query = user['recorder_id']
+                cursor.execute("SELECT count(*) as count FROM patients WHERE recorder_id = %s", (recorder_id_for_query,)) # 修改點
+                patient_count = cursor.fetchone()['count']
+                if patient_count < 4:
+                     items.append(
+                        QuickReplyButton(
+                            action=PostbackAction(
+                                label="⊕ 新增家人",
+                                data="action=add_new_patient",
+                                display_text="新增家人"
+                            )
+                        )
+                    )
+        except Exception as e:
+            logging.error(f"Error checking patient count for management menu: {e}")
+        finally:
+            if conn.is_connected():
+                conn.close()
 
-    # 處理刪除用藥提醒
-    if data.startswith("action=delete_reminder"):
+    return TextSendMessage(text="請問您要進行哪種用藥管理操作？", quick_reply=QuickReply(items=items))
+
+
+def create_patient_edit_message(line_id: str):
+    conn = get_conn()
+    if not conn:
+        return TextSendMessage(text="抱歉，無法連接到使用者資料庫。")
+    items = []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_id,))
+        user = cursor.fetchone()
+        if not user:
+            return TextSendMessage(text="找不到您的使用者資料。")
+        recorder_id_for_query = user['recorder_id']
+        cursor.execute("SELECT member FROM patients WHERE recorder_id = %s AND member != '本人' ORDER BY member", (recorder_id_for_query,))
+        editable_patients = cursor.fetchall()
+        if not editable_patients:
+            return TextSendMessage(text="您目前沒有可供修改的家人名單喔！")
+        for patient in editable_patients:
+            items.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label=f"修改「{patient['member']}」",
+                        data=f"action=edit_patient_start&member_to_edit={quote(patient['member'])}",
+                        display_text=f"我想修改「{patient['member']}」的名稱"
+                    )
+                )
+            )
+    except Exception as e:
+        logging.error(f"Error in create_patient_edit_message: {e}")
+        return TextSendMessage(text="抱歉，在讀取家人名單時發生錯誤。")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+    return TextSendMessage(text="請問您想修改哪一位家人的名稱？", quick_reply=QuickReply(items=items))
+
+
+def get_patient_id_by_member_name(line_id: str, member_name: str) -> bool:
+    conn = get_conn()
+    if not conn:
+        return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_id,))
+        user = cursor.fetchone()
+        if not user:
+            return None
+        recorder_id_for_query = user[0]
+        cursor.execute("SELECT COUNT(*) FROM patients WHERE recorder_id = %s AND member = %s", (recorder_id_for_query, member_name))
+        patient = cursor.fetchone()
+        return patient[0] if patient else None
+    except Exception as e:
+        logging.error(f"Error in get_patient_id_by_member_name: {e}")
+        return None
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+# ------------------------------------------------------------
+# 處理 OCR 辨識結果並引導使用者設定提醒 (Existing code)
+# ------------------------------------------------------------
+def handle_ocr_recognition_result(reply_token, line_bot_api, user_id, parsed_data):
+    """
+    處理 OCR 辨識出的藥單資訊，引導使用者設定用藥提醒。
+    """
+    if not parsed_data or not parsed_data.get('medicine_name') or not parsed_data.get('frequency_code'):
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="藥單辨識結果不完整，請嘗試重新拍照或手動輸入。"))
         clear_temp_state(user_id)
-        params = dict(item.split("=") for item in data.split("&")[1:])
-        time_to_delete = params.get("time")
-        medicine_id_to_delete = params.get("medicine_id")
-        
-        if time_to_delete and medicine_id_to_delete:
-            delete_medication_reminder(user_id, medicine_id_to_delete, time_to_delete)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已刪除 {time_to_delete} 的用藥提醒。"))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 刪除失敗，請再試一次。"))
-        return True
+        return
 
-    # 處理選擇藥品 -> 進入選擇劑量步驟
-    if data.startswith("action=select_medicine") and temp_state and temp_state.get('state') == 'selecting_medicine':
-        params = dict(item.split("=") for item in data.split("&")[1:])
-        medicine_id = params.get("medicine_id")
-        medicine_name = params.get("medicine_name")
+    # Assuming 'member' is already stored in temp_state or passed from initial patient selection
+    temp_state = get_temp_state(user_id)
+    selected_member = temp_state.get("member")
 
-        if medicine_id and medicine_name:
-            # 更新暫存狀態，進入選擇劑量階段
-            set_temp_state(user_id, {
-                'state': 'selecting_dosage',
-                'medicine_id': medicine_id,
-                'medicine_name': medicine_name
-            })
-            send_dosage_selection(user_id, event.reply_token, line_bot_api, medicine_name)
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 選擇藥品失敗，請再試一次。"))
-        return True
+    if not selected_member:
+        # This case should ideally not happen if patient selection is enforced
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="請先選擇用藥對象。"))
+        return
 
-    # 處理選擇劑量 -> 進入選擇時間步驟
-    if data.startswith("action=select_dosage") and temp_state and temp_state.get('state') == 'selecting_dosage':
-        params = dict(item.split("=") for item in data.split("&")[1:])
-        selected_dosage = params.get("dosage")
-
-        if selected_dosage:
-            temp_state['dosage'] = selected_dosage
-            # 如果選擇「其他」，進入等待用戶輸入自定義劑量的狀態
-            if selected_dosage == '其他劑量':
-                temp_state['state'] = 'awaiting_custom_dosage'
-                set_temp_state(user_id, temp_state)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入您要設定的劑量："))
-                return True
-            
-            # 更新狀態為等待時間選擇 (多選時間)
-            temp_state['state'] = 'selecting_time'
-            set_temp_state(user_id, temp_state)
-            medicine_name = temp_state.get('medicine_name', '未知藥品')
-            dosage = temp_state.get('dosage')
-            send_time_selection(user_id, event.reply_token, line_bot_api, medicine_name, dosage, initial_message=True)
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 選擇劑量失敗，請再試一次。"))
-        return True
-
-    # 處理 DatetimePicker 設定時間 -> 儲存並重新詢問或完成
-    if data == "action=set_med_time" and event.postback.params:
-        selected_time = event.postback.params.get("time")
-        if selected_time and temp_state and temp_state.get('state') == 'selecting_time':
-            medicine_id = temp_state.get('medicine_id')
-            medicine_name = temp_state.get('medicine_name', '未知藥品')
-            dosage = temp_state.get('dosage')
-            # 頻率固定為「多個時段」，表示用戶可自訂多個時間點
-            frequency = "多個時段" 
-
-            if medicine_id and medicine_name and dosage:
-                # 儲存完整的提醒信息，包括劑量和頻率
-                print(f"DEBUG: Adding reminder for {user_id}: {medicine_name} at {selected_time}, Dosage: {dosage}, Frequency: {frequency}")
-                add_medication_reminder(user_id, medicine_id, selected_time, dosage, frequency)
-                # 不清除暫存狀態，而是重新發送時間選擇訊息，讓用戶可以繼續新增時間
-                send_time_selection(user_id, event.reply_token, line_bot_api, medicine_name, dosage, initial_message=False)
-            else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 儲存失敗，請從頭開始設定。"))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 設定時間失敗，請再試一次。"))
-        return True
-    return False
-
-
-# -------------------------------------------------------------
-# 輔助函式：用於發送 Quick Reply
-# -------------------------------------------------------------
-def send_dosage_selection(user_id, reply_token, line_bot_api, medicine_name):
-    print(f"DEBUG: Entering send_dosage_selection. User: {user_id}, Medicine: {medicine_name}")
-    buttons = []
-    for option in DOSAGE_OPTIONS:
-        buttons.append(
-            QuickReplyButton(
-                action=PostbackAction(
-                    label=option['label'],
-                    data=f"action=select_dosage&dosage={option['data']}"
-                )
-            )
-        )
-    try:
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(
-                text=f"您選擇了「{medicine_name}」。\n請選擇劑量：",
-                quick_reply=QuickReply(items=buttons)
-            )
-        )
-        print(f"DEBUG: Successfully sent dosage selection message to {user_id}")
-    except LineBotApiError as e:
-        print(f"ERROR: Failed to send dosage selection message to {user_id}: {e}")
-    except Exception as e:
-        print(f"CRITICAL ERROR in send_dosage_selection for {user_id}: {e}")
-
-
-def send_time_selection(user_id, reply_token, line_bot_api, medicine_name, dosage, initial_message=True):
-    print(f"DEBUG: Entering send_time_selection. User: {user_id}, Medicine: {medicine_name}, Dosage: {dosage}")
-    text_message = ""
-    if initial_message:
-        text_message = f"您已設定藥品「{medicine_name}」，劑量「{dosage}」。\n請選擇用藥時間，或點擊「完成設定」結束："
-    else:
-        text_message = f"已成功新增一個用藥時間。還有其他時間嗎？請選擇用藥時間，或點擊「完成設定」結束："
-
+    set_temp_state(user_id, {
+        "state": "AWAITING_MED_FREQUENCY",
+        "member": selected_member,
+        "medicine_name": parsed_data['medicine_name'],
+        "dosage": parsed_data.get('dosage', '未設定'),
+        "frequency_code": parsed_data['frequency_code'],
+        "days": parsed_data.get('days'),
+        "source_detail": "OCR_Scan"
+    })
+    # Proceed to ask for frequency confirmation or directly to time if frequency is clear
+    frequency_name = parsed_data.get('frequency_name', get_frequency_name(parsed_data['frequency_code']))
     message = TextSendMessage(
-        text=text_message,
-        quick_reply=QuickReply(
-            items=[
-                QuickReplyButton(
-                    action=DatetimePickerAction(
-                        label="選擇時間",
-                        data="action=set_med_time",
-                        mode="time",
-                        initial="08:00"
-                    )
-                ),
-                QuickReplyButton(
-                    action=MessageAction(label="完成設定", text="完成用藥時間設定")
-                )
-            ]
-        )
+        text=f"已辨識藥品名稱為：{parsed_data['medicine_name']}。\n"
+             f"頻率：{frequency_name}。\n"
+             f"請問這個資訊正確嗎？",
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(
+                action=PostbackAction(label="正確", data="action=confirm_ocr_frequency_correct")
+            ),
+            QuickReplyButton(
+                action=PostbackAction(label="修改頻率", data="action=set_frequency")
+            )
+        ])
     )
+    line_bot_api.reply_message(reply_token, message)
+
+def handle_medication_record_time_selected(reply_token, line_bot_api, user_id, time_slot_input):
+    current_state = get_temp_state(user_id) or {}
+    member = current_state.get("member")
+    medicine_name = current_state.get("medicine_name")
+    dosage = current_state.get("dosage")
+    record_date = current_state.get("record_date")
+
+    if not all([member, medicine_name, dosage, record_date]):
+        clear_temp_state(user_id)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥記錄資訊不完整，請重新開始。"))
+        return
+
+    # 嘗試將輸入的時間轉換為 H:M 格式
+    match = re.match(r'^(\d{1,2})[時點:](\d{2})$', time_slot_input)
+    if not match:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="時間格式不正確，請輸入 HH:MM 格式，例如 14:30 或 8點30。"))
+        return
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="時間無效，小時應在 0-23 之間，分鐘應在 0-59 之間。"))
+        return
+
+    # 將日期和時間組合成完整的 datetime 物件
     try:
+        record_datetime_str = f"{record_date} {hour:02d}:{minute:02d}:00"
+        record_datetime = datetime.strptime(record_datetime_str, '%Y-%m-%d %H:%M:%S')
+    except ValueError as e:
+        logging.error(f"Error parsing record_datetime: {e}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="日期或時間格式轉換失敗，請稍後再試。"))
+        return
+
+    # 從資料庫獲取 drug_id
+    drug_id_result = get_medicine_id_by_name(medicine_name)
+    if not drug_id_result:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到藥品「{medicine_name}」的資訊，請檢查藥品名稱。"))
+        clear_temp_state(user_id)
+        return
+    drug_id = drug_id_result['drug_id']
+
+    # 嘗試將 dosage 分割為數量和單位
+    dose_quantity = None
+    dosage_unit = None
+    dose_match = re.match(r'([\d.]+)\s*(\S+)', dosage) # 例如 "1 錠"
+    if dose_match:
+        try:
+            dose_quantity = float(dose_match.group(1))
+            dosage_unit = dose_match.group(2).strip()
+        except ValueError:
+            pass # 如果轉換失敗，就保持 None
+
+    if dose_quantity is None: # 如果無法解析，嘗試直接作為 quantity，單位留空
+        try:
+            dose_quantity = float(dosage)
+        except ValueError:
+            dose_quantity = None # 最終還是無法解析，保持 None
+
+    # 頻率名稱暫時設定為 '單次' 或其他預設值，因為這是用藥記錄，不是長期提醒
+    frequency_name = get_frequency_name('單次') # 假設有一個 '單次' 頻率
+    if not frequency_name:
+        logging.error("Frequency '單次' not found in frequency_code table.")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="系統配置錯誤：找不到預設頻率。"))
+        clear_temp_state(user_id)
+        return
+
+    source_detail = "手動輸入" # 或 "OCR"
+    days = 1 # 對於單次記錄，天數設為1
+
+    try:
+        # 添加用藥記錄到資料庫
+        # medication_record 表中的 dosage_unit 欄位
+        add_medication_record(
+            recorder_id=user_id,
+            member=member,
+            drug_id=drug_id,
+            frequency_name=frequency_name,
+            source_detail=source_detail,
+            dose_quantity=dose_quantity,
+            dosage_unit=dosage_unit, # 傳遞解析出的 dosage_unit
+            days=days,
+            record_datetime=record_datetime
+        )
+
+        # 詢問是否繼續新增其他藥品
+        set_temp_state(user_id, {"state": "AWAITING_ADDITIONAL_DRUGS_CHOICE", "member": member})
+        message = TextSendMessage(
+            text=f"已成功記錄「{member}」在 {record_datetime.strftime('%Y年%m月%d日 %H點%M分')} 服用「{medicine_name} {dosage}」。\n\n是否需要繼續新增其他藥品記錄？",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="是", text="是")),
+                QuickReplyButton(action=MessageAction(label="否", text="否"))
+            ])
+        )
         line_bot_api.reply_message(reply_token, message)
-        print(f"DEBUG: Successfully sent time selection message to {user_id}")
-    except LineBotApiError as e:
-        print(f"ERROR: Failed to send time selection message to {user_id}: {e}")
-        try:
-            line_bot_api.push_message(user_id, TextSendMessage(text="抱歉，設定時間時發生錯誤，請重新開始。"))
-        except Exception as push_e:
-            print(f"ERROR: Also failed to push error message: {push_e}")
+
     except Exception as e:
-        print(f"CRITICAL ERROR in send_time_selection for {user_id}: {e}")
+        logging.error(f"Error adding medication record: {e}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="記錄用藥資訊時發生錯誤，請稍後再試。"))
+    finally:
+        # 不需要在這裡清空狀態，因為可能還會繼續新增其他藥品
+        pass
+
+
+# ------------------------------------------------------------
+# 處理 Postback 事件 (Existing code - modified to include new actions)
+# ------------------------------------------------------------
+def handle_postback(event, line_bot_api, user_states):
+    reply_token = event.reply_token
+    line_user_id = event.source.user_id
+    postback_data = event.postback.data
+    params = {k: v[0] for k, v in parse_qs(postback_data).items()}
+    action = params.get("action")
+    current_state_info = get_temp_state(line_user_id) # Using get_temp_state from models
+
+    if action == "select_patient_for_reminder":
+        member = params.get('member')
+        if member:
+            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品"))
+                ])
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+    elif action == "select_patient_for_reminder_initial": # This action is from the "用藥管理" menu to initiate patient selection
+        line_bot_api.reply_message(reply_token, create_patient_selection_message(line_user_id))
+    elif action == "set_frequency":
+        set_temp_state(line_user_id, {"state": "AWAITING_FREQUENCY_SELECTION", **current_state_info})
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請選擇用藥頻率：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=PostbackAction(label="每日一次", data="action=set_frequency_val&val=1_day")),
+                QuickReplyButton(action=PostbackAction(label="每日二次", data="action=set_frequency_val&val=2_day")),
+                QuickReplyButton(action=PostbackAction(label="每日三次", data="action=set_frequency_val&val=3_day")),
+                QuickReplyButton(action=PostbackAction(label="每日四次", data="action=set_frequency_val&val=4_day")),
+                QuickReplyButton(action=PostbackAction(label="固定時間", data="action=set_frequency_val&val=fixed_times")),
+                QuickReplyButton(action=PostbackAction(label="需要時", data="action=set_frequency_val&val=as_needed"))
+            ])
+        ))
+    elif action == "set_frequency_val":
+        frequency_val = params.get("val")
+        current_state_info["frequency_code"] = frequency_val
+        current_state_info["state"] = "AWAITING_DOSAGE"
+        set_temp_state(line_user_id, current_state_info)
+        # Check if dosage is already parsed from OCR, if so, ask for confirmation
+        if current_state_info.get("dosage") and current_state_info["dosage"] != "未設定":
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"建議劑量為：{current_state_info['dosage']}。正確嗎？",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label="正確", data="action=confirm_dosage_correct")),
+                    QuickReplyButton(action=PostbackAction(label="修改劑量", data="action=set_dosage"))
+                ])
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="請選擇用藥劑量：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label=opt['label'], data=f"action=set_dosage_val&val={opt['data']}")) for opt in DOSAGE_OPTIONS
+                ])
+            ))
+    elif action == "set_dosage":
+        set_temp_state(line_user_id, {"state": "AWAITING_DOSAGE", **current_state_info})
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請選擇用藥劑量：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=PostbackAction(label=opt['label'], data=f"action=set_dosage_val&val={opt['data']}")) for opt in DOSAGE_OPTIONS
+            ])
+        ))
+    elif action == "confirm_dosage_correct":
+        set_temp_state(line_user_id, {"state": "AWAITING_DAYS_INPUT", **current_state_info})
+        if current_state_info.get('days'):
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"用藥天數為：{current_state_info['days']}天。正確嗎？",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label="正確", data="action=confirm_days_correct")),
+                    QuickReplyButton(action=PostbackAction(label="修改天數", data="action=set_days"))
+                ])
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="請輸入用藥天數：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="7天", text="7天")),
+                    QuickReplyButton(action=MessageAction(label="14天", text="14天")),
+                    QuickReplyButton(action=MessageAction(label="28天", text="28天")),
+                    QuickReplyButton(action=MessageAction(label="30天", text="30天")),
+                    QuickReplyButton(action=MessageAction(label="長期", text="長期")),
+                ])
+            ))
+    elif action == "confirm_ocr_frequency_correct":
+        set_temp_state(line_user_id, {"state": "AWAITING_DOSAGE", **current_state_info})
+        # Check if dosage is already parsed from OCR, if so, ask for confirmation
+        if current_state_info.get("dosage") and current_state_info["dosage"] != "未設定":
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"建議劑量為：{current_state_info['dosage']}。正確嗎？",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label="正確", data="action=confirm_dosage_correct")),
+                    QuickReplyButton(action=PostbackAction(label="修改劑量", data="action=set_dosage"))
+                ])
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="請選擇用藥劑量：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label=opt['label'], data=f"action=set_dosage_val&val={opt['data']}")) for opt in DOSAGE_OPTIONS
+                ])
+            ))
+    elif action == "set_dosage_val":
+        dosage_val = params.get("val")
+        current_state_info["dosage"] = dosage_val
+        current_state_info["state"] = "AWAITING_DAYS_INPUT"
+        set_temp_state(line_user_id, current_state_info)
+        # Proceed to ask for days
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請輸入用藥天數：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="7天", text="7天")),
+                QuickReplyButton(action=MessageAction(label="14天", text="14天")),
+                QuickReplyButton(action=MessageAction(label="28天", text="28天")),
+                QuickReplyButton(action=MessageAction(label="30天", text="30天")),
+                QuickReplyButton(action=MessageAction(label="長期", text="長期")),
+            ])
+        ))
+    elif action == "set_days":
+        set_temp_state(line_user_id, {"state": "AWAITING_DAYS", **current_state_info})
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請輸入用藥天數：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="7天", text="7天")),
+                QuickReplyButton(action=MessageAction(label="14天", text="14天")),
+                QuickReplyButton(action=MessageAction(label="28天", text="28天")),
+                QuickReplyButton(action=MessageAction(label="30天", text="30天")),
+                QuickReplyButton(action=MessageAction(label="長期", text="長期")),
+            ])
+        ))
+    elif action == "confirm_days_correct":
+        # Final step for adding medication reminder
+        # ... (logic to add reminder to DB)
+        add_medication_reminder_full(line_user_id, current_state_info)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥提醒已成功新增！"))
+        clear_temp_state(line_user_id)
+    elif action == "set_med_record_time":
+        record_time = event.postback.params['time']
+        current_state_info["record_time"] = record_time
+        set_temp_state(line_user_id, {"state": "CONFIRM_MED_RECORD", **current_state_info})
+        # Now, confirm and save record
+        member = current_state_info.get("member")
+        medicine_name = current_state_info.get("medicine_name")
+        dosage = current_state_info.get("dosage")
+        record_date = current_state_info.get("record_date") # Assuming record_date is already set
+
+        message_text = (
+            f"您確定要記錄「{member}」在 {record_date} {record_time} 服用「{medicine_name}」{dosage} 嗎？"
+        )
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text=message_text,
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=PostbackAction(label="確定記錄", data="action=confirm_add_med_record")),
+                QuickReplyButton(action=MessageAction(label="取消", text="取消"))
+            ])
+        ))
+
+    elif action == "confirm_add_med_record":
+        member = current_state_info.get("member")
+        medicine_name = current_state_info.get("medicine_name")
+        dosage = current_state_info.get("dosage")
+        record_date = current_state_info.get("record_date")
+        record_time = current_state_info.get("record_time")
+
+        if all([member, medicine_name, dosage, record_date, record_time]):
+            # Get medicine_id for the drug
+            medicine_id = get_medicine_id_by_name(medicine_name)
+            if not medicine_id:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"抱歉，藥品「{medicine_name}」未在資料庫中找到。請手動新增。"))
+                clear_temp_state(line_user_id)
+                return
+
+            try:
+                # Assuming add_medication_record takes patient_id
+                # You'll need to get the patient_id from the member name and line_user_id
+                patient_id = get_patient_id_by_member_name(line_user_id, member)
+                if patient_id:
+                    add_medication_record(line_user_id, patient_id, medicine_id, dosage, record_date, record_time)
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥記錄已成功新增！"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到該用藥對象的資料。"))
+            except Exception as e:
+                logging.error(f"Error adding medication record: {e}")
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="新增用藥記錄失敗，請稍後再試。"))
+            finally:
+                clear_temp_state(line_user_id)
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥記錄資訊不完整，請重新開始。"))
+            clear_temp_state(line_user_id)
+
+    # Handle reminder management actions
+    elif action.startswith("show_reminders_"):
+        member = action.split("_")[2] # Extract member from action string
+        conn = get_conn()
+        if not conn:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，資料庫連線失敗。"))
+            return
         try:
-            line_bot_api.push_message(user_id, TextSendMessage(text="抱歉，設定時間時發生未知錯誤，請重新開始。"))
-        except Exception as push_e:
-            print(f"ERROR: Also failed to push error message: {push_e}")
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_user_id,))
+            user = cursor.fetchone()
+            if not user:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到您的使用者資料。"))
+                return
+            user_id = user['user_id']
+            cursor.execute("SELECT patient_id FROM patients WHERE user_id = %s AND member = %s", (user_id, member))
+            patient = cursor.fetchone()
+            if not patient:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
+                return
+            patient_id = patient['patient_id']
+
+            reminders = get_medication_reminders_for_user(patient_id)
+            if not reminders:
+                message = TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。")
+            else:
+                reminder_messages = []
+                for r in reminders:
+                    reminder_messages.append(f"藥品：{r['medicine_name']}, 頻率：{r['frequency_name']}, 劑量：{r['dose_quantity']}{r['dosage_unit']}, 時間：{r['reminder_time']}")
+                message = TextSendMessage(text=f"「{member}」的用藥提醒：\n" + "\n".join(reminder_messages),
+                                          quick_reply=QuickReply(items=[
+                                              QuickReplyButton(
+                                                  action=PostbackAction(label="刪除提醒", data=f"action=delete_reminder_for_member&member={member}")
+                                              )
+                                          ]))
+            line_bot_api.reply_message(reply_token, message)
+        except Exception as e:
+            logging.error(f"Error showing reminders for member {member}: {e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="查詢提醒失敗，請稍後再試。"))
+        finally:
+            if conn.is_connected():
+                conn.close()
+
+    elif action == "delete_reminder_for_member":
+        member = params.get('member')
+        if not member:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到用藥對象資訊。"))
+            return
+
+        conn = get_conn()
+        if not conn:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，資料庫連線失敗。"))
+            return
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_user_id,))
+            user = cursor.fetchone()
+            if not user:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到您的使用者資料。"))
+                return
+            user_id = user['user_id']
+            cursor.execute("SELECT patient_id FROM patients WHERE user_id = %s AND member = %s", (user_id, member))
+            patient = cursor.fetchone()
+            if not patient:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
+                return
+            patient_id = patient['patient_id']
+
+            reminders = get_medication_reminders_for_user(patient_id)
+            if not reminders:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"「{member}」目前沒有可刪除的用藥提醒。"))
+                return
+
+            items = []
+            set_temp_state(line_user_id, {"state": "AWAITING_REMINDER_TO_DELETE", "member": member, "reminders_list": reminders})
+            for i, r in enumerate(reminders):
+                items.append(
+                    QuickReplyButton(
+                        action=PostbackAction(
+                            label=f"刪除 {r['medicine_name']} ({r['reminder_time']})",
+                            data=f"action=confirm_delete_reminder&reminder_index={i}"
+                        )
+                    )
+                )
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"請選擇要刪除「{member}」的哪一個提醒：",
+                quick_reply=QuickReply(items=items)
+            ))
+        except Exception as e:
+            logging.error(f"Error preparing delete reminder menu for member {member}: {e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="準備刪除提醒失敗，請稍後再試。"))
+        finally:
+            if conn.is_connected():
+                conn.close()
+
+    elif action == "confirm_delete_reminder":
+        reminder_index = int(params.get('reminder_index'))
+        current_state = get_temp_state(line_user_id)
+        reminders_list = current_state.get("reminders_list")
+        member = current_state.get("member")
+
+        if reminders_list and 0 <= reminder_index < len(reminders_list):
+            reminder_to_delete = reminders_list[reminder_index]
+            try:
+                delete_medication_reminder_time(reminder_to_delete['reminder_time_id'])
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已成功刪除「{member}」的用藥提醒：{reminder_to_delete['medicine_name']} ({reminder_to_delete['reminder_time']})。"))
+            except Exception as e:
+                logging.error(f"Error deleting reminder: {e}")
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="刪除提醒失敗，請稍後再試。"))
+            finally:
+                clear_temp_state(line_user_id)
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="無效的提醒選擇，請重新操作。"))
+            clear_temp_state(line_user_id)
+
+
+# ... (rest of the existing functions in medication_reminder.py)
+
+# ------------------------------------------------------------
+# 處理用藥記錄
+# ------------------------------------------------------------
+def handle_medication_record_command(reply_token, line_bot_api, user_id):
+    # This will now first ask for patient selection
+    set_temp_state(user_id, {"state": "AWAITING_MED_RECORD_PATIENT"})
+    message = create_patient_selection_message(user_id)
+    line_bot_api.reply_message(reply_token, message)
+
+def handle_medication_record_member_selected(reply_token, line_bot_api, user_id, member_name):
+    # This function is called after patient selection for medication record
+    set_temp_state(user_id, {
+        "state": "AWAITING_MED_RECORD_DATE",
+        "member": member_name
+    })
+    message = TextSendMessage(text=f"已選擇用藥對象為「{member_name}」。請選擇用藥日期：",
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(
+                action=DatetimePickerAction(
+                    label="選擇日期",
+                    data="action=set_med_record_date",
+                    mode="date",
+                    initial=datetime.date.today().strftime("%Y-%m-%d")
+                )
+            )
+        ])
+    )
+    line_bot_api.reply_message(reply_token, message)
+
+def handle_medication_record_date_selected(reply_token, line_bot_api, user_id, record_date):
+    current_state = get_temp_state(user_id)
+    member = current_state.get("member")
+    set_temp_state(user_id, {
+        "state": "AWAITING_MED_RECORD_MEDICINE_NAME",
+        "member": member,
+        "record_date": record_date
+    })
+    line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入藥品名稱："))
+
+def handle_medication_record_medicine_name_input(reply_token, line_bot_api, user_id, medicine_name):
+    current_state = get_temp_state(user_id)
+    member = current_state.get("member")
+    record_date = current_state.get("record_date")
+    set_temp_state(user_id, {
+        "state": "AWAITING_MED_RECORD_DOSAGE",
+        "member": member,
+        "medicine_name": medicine_name,
+        "record_date": record_date
+    })
+    message = TextSendMessage(text="請選擇該次用藥劑量：",
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(action=PostbackAction(label=opt['label'], data=f"action=set_med_record_dosage&val={opt['data']}")) for opt in DOSAGE_OPTIONS
+        ])
+    )
+    line_bot_api.reply_message(reply_token, message)
+
+def handle_medication_record_dosage_selected(reply_token, line_bot_api, user_id, dosage):
+    current_state = get_temp_state(user_id)
+    member = current_state.get("member")
+    medicine_name = current_state.get("medicine_name")
+    record_date = current_state.get("record_date")
+    set_temp_state(user_id, {
+        "state": "AWAITING_MED_RECORD_TIME",
+        "member": member,
+        "medicine_name": medicine_name,
+        "dosage": dosage,
+        "record_date": record_date
+    })
+    message = TextSendMessage(text="請選擇該次用藥時間：",
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(
+                action=DatetimePickerAction(
+                    label="選擇時間",
+                    data="action=set_med_record_time",
+                    mode="time",
+                    initial="08:00" # 提供預設時間
+                )
+            )
+        ])
+    )
+    line_bot_api.reply_message(reply_token, message)

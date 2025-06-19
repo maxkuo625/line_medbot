@@ -1,154 +1,198 @@
 from linebot.models import (
     TextSendMessage, FlexSendMessage,
-    QuickReply, QuickReplyButton, # 確保 QuickReply, QuickReplyButton 已導入
-    MessageAction, URIAction # 確保 MessageAction, URIAction 已導入
+    QuickReply, QuickReplyButton,
+    MessageAction, URIAction,
+    PostbackAction, DatetimePickerAction
 )
-from models import create_user_if_not_exists, bind_family, generate_invite_code
+
+# 確保從 models 模組中導入所有需要的函數
+from models import (
+    create_user_if_not_exists,
+    bind_family,
+    generate_invite_code,
+    clear_temp_state,      # 確保導入 clear_temp_state
+    set_temp_state,        # 確保導入 set_temp_state
+    get_medication_reminders_for_user, # 確保導入 get_medication_reminders_for_user
+    get_temp_state # 確保導入 get_temp_state，用於檢查狀態
+)
+
 import re
-from urllib.parse import quote # 確保 quote 已導入
+from urllib.parse import quote
 
+# 從 medication_reminder 導入需要的函數
+from medication_reminder import (
+    create_patient_selection_message, # 用於「新增用藥提醒」等需要選擇用藥者的入口
+    create_medication_management_menu, # 用於「用藥管理」入口
+    handle_ocr_recognition_result, # 處理 OCR 結果
+    handle_medication_record_command, # 處理用藥記錄的起始指令
+    handle_medication_record_member_selected,
+    handle_medication_record_date_selected,
+    handle_medication_record_medicine_name_input,
+    handle_medication_record_dosage_selected,
+    handle_medication_record_time_selected
+)
+
+from database import get_conn # 確保導入 get_conn
+
+# 修改 handle_text_message 的函數簽名，移除 user_states
 def handle_text_message(event, line_bot_api):
-    user_id = event.source.user_id
-    text = event.message.text.strip()
+    reply_token = event.reply_token
+    line_user_id = event.source.user_id
+    message_text = event.message.text.strip()
 
-    print(f"✅ 收到使用者訊息：{text}（來自 {user_id}）") #
+    # 修改點：使用 get_temp_state 獲取狀態，並使用 or {} 確保返回字典
+    current_state = get_temp_state(line_user_id) or {}
+    state = current_state.get("state")
 
-    create_user_if_not_exists(user_id) #
+    # 處理 OCR 辨識結果的訊息 (假設這是在圖片訊息後傳送的文本)
+    if state == "AWAITING_OCR_CONFIRMATION" and message_text in ["是", "否"]:
+        handle_ocr_recognition_result(reply_token, line_user_id, message_text, line_bot_api)
+        return
 
-    # 綁定邀請碼
-    match = re.match(r"^綁定\s*(\S+)", text) # 調整正規表達式，\S+ 匹配非空白字元，更彈性
-    if match: #
-        code = match.group(1) #
-        print(f"🧪 嘗試綁定邀請碼：{code}") #
-        
-        # 根據 models.py 的 bind_family(invite_code, family_user_id) 調整參數順序
-        success, elder_id = bind_family(code, user_id) #
-        if success:
+    # 處理「用藥記錄」相關的文字輸入
+    if state == "AWAITING_MED_RECORD_MEMBER":
+        handle_medication_record_member_selected(reply_token, line_bot_api, line_user_id, message_text)
+        return
+    elif state == "AWAITING_MED_RECORD_DATE":
+        handle_medication_record_date_selected(reply_token, line_bot_api, line_user_id, message_text)
+        return
+    elif state == "AWAITING_MEDICINE_NAME":
+        if current_state.get("record_date"):
+            # 有 record_date，代表來自「新增用藥記錄」
+            handle_medication_record_medicine_name_input(reply_token, line_bot_api, line_user_id, message_text)
+        else:
+            # 否則是來自「新增提醒」
+            set_temp_state(line_user_id, {
+                "state": "AWAITING_FREQUENCY_SELECTION",
+                "member": current_state.get("member"),
+                "medicine_name": message_text
+        })
+    elif state == "AWAITING_MED_RECORD_DOSAGE": # 從 OCR 流程跳轉過來手動輸入劑量
+        handle_medication_record_dosage_selected(reply_token, line_bot_api, line_user_id, message_text)
+        return
+    elif state == "AWAITING_MED_RECORD_TIME": # 從 OCR 流程跳轉過來手動輸入時間
+        handle_medication_record_time_selected(reply_token, line_bot_api, line_user_id, message_text)
+        return
+    elif state == "AWAITING_ADDITIONAL_DRUGS_CHOICE": # 詢問是否繼續新增藥品
+        member = current_state.get("member")
+        if message_text == "是":
+            # 修改點：使用 set_temp_state
+            set_temp_state(line_user_id, {"state": "AWAITING_MEDICINE_NAME", "member": member})
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"請輸入下一個藥品名稱或上傳藥單照片："))
+        elif message_text == "否":
+            # 修改點：使用 clear_temp_state
+            clear_temp_state(line_user_id)
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="好的，已完成所有藥品提醒的設定。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請回答「是」或「否」。"))
+        return
+
+
+    # 處理一般文字訊息
+    if message_text == "綁定":
+        # 修改點：使用 set_temp_state
+        set_temp_state(line_user_id, {"state": "AWAITING_INVITE_CODE"})
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="好的，請輸入您收到的邀請碼："))
+
+    elif state == "AWAITING_INVITE_CODE":
+        invite_code = message_text
+        # 修改點：使用 clear_temp_state
+        clear_temp_state(line_user_id)
+        try:
+            # 嘗試綁定家庭
+            if bind_family(invite_code, line_user_id):
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="綁定成功！您現在可以看到家庭成員的用藥提醒了。"))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="綁定失敗，邀請碼無效或已過期。"))
+        except Exception as e:
+            print(f"Error binding family: {e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="綁定過程中發生錯誤，請稍後再試。"))
+
+    elif message_text == "解除綁定":
+        # 修改點：使用 set_temp_state
+        set_temp_state(line_user_id, {"state": "AWAITING_UNBIND_CONFIRMATION"})
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="您確定要解除家庭綁定嗎？請輸入「是」或「否」。"))
+
+    elif state == "AWAITING_UNBIND_CONFIRMATION":
+        if message_text == "是":
             try:
-                profile = line_bot_api.get_profile(elder_id)
-                elder_display_name = profile.display_name
-            except Exception:
-                elder_display_name = "您的家人" # 如果無法獲取名稱，使用預設值
+                # 假設這裡有解除綁定的邏輯，例如刪除 invitation_recipients 表中的記錄
+                # 由於沒有提供解除綁定的具體函數，這裡只清空狀態
+                # 實作時需要呼叫實際的解除綁定函數
+                clear_temp_state(line_user_id) # 修改點：使用 clear_temp_state
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="已解除家庭綁定。"))
+            except Exception as e:
+                print(f"Error unbinding family: {e}")
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="解除綁定失敗，請稍後再試。"))
+        elif message_text == "否":
+            # 修改點：使用 clear_temp_state
+            clear_temp_state(line_user_id)
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="已取消解除綁定。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請回答「是」或「否」。"))
 
-            reply = f"✅ 綁定成功！您將收到 {elder_display_name} 的用藥通知。" #
-        else: #
-            reply = "❌ 邀請碼無效或已使用。" #
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply)) #
-        return
-    elif text == "綁定": # 處理只輸入「綁定」的情況
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 請提供有效的邀請碼，格式：綁定 [邀請碼]。"))
-        return
+    elif message_text == "用藥管理":
+        # 這裡會重複 app.py 的處理，但作為 fallback 可以保留
+        line_bot_api.reply_message(reply_token, create_medication_management_menu(line_user_id))
+
+    elif message_text == "新增用藥提醒":
+        # 修改點：使用 set_temp_state
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_REMINDER"})
+        line_bot_api.reply_message(reply_token, create_patient_selection_message(line_user_id))
+
+    elif message_text == "查看提醒":
+        flex_message = create_patient_selection_for_reminders_view(line_user_id)
+        if flex_message:
+            line_bot_api.reply_message(reply_token, flex_message)
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何家人需要查看提醒。"))
+
+    elif message_text == "新增用藥記錄":
+        # 調用 medication_reminder 模組中的函數來處理
+        handle_medication_record_command(reply_token, line_bot_api, line_user_id)
+
+    else:
+        # 其他未知的文字訊息
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，我不太明白您的意思。您可以嘗試輸入「綁定」或「用藥管理」等指令。"))
 
 
-    # 產生邀請碼
-    if text == "產生邀請碼": #
-        invite_code = generate_invite_code(user_id)
+# 這是 create_patient_selection_for_reminders_view 的實現，用於「查看提醒」
+def create_patient_selection_for_reminders_view(line_id):
+    conn = get_conn()
+    if not conn:
+        return TextSendMessage(text="抱歉，無法連接到使用者資料庫。")
+    items = []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        # 修改點：users 表格的 primary key 是 recorder_id，所以直接用 line_id 查詢
+        cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_id,))
+        user = cursor.fetchone()
+        if not user:
+            return TextSendMessage(text="找不到您的使用者資料。")
+        recorder_id_for_db = user['recorder_id'] # 使用 recorder_id
 
-        # 創建 Flex Message
-        flex_message = FlexSendMessage(
-            alt_text="您的邀請碼資訊", #
-            contents={ #
-                "type": "bubble", #
-                "body": { #
-                    "type": "box", #
-                    "layout": "vertical", #
-                    "contents": [ #
-                        {
-                            "type": "text", #
-                            "text": "✅ 邀請碼已產生", #
-                            "weight": "bold", #
-                            "size": "xl", #
-                            "margin": "md", #
-                            "align": "center", #
-                        },
-                        {"type": "separator", "margin": "lg"}, #
-                        {
-                            "type": "box", #
-                            "layout": "vertical", #
-                            "margin": "lg", #
-                            "spacing": "sm", #
-                            "contents": [ #
-                                {
-                                    "type": "box", #
-                                    "layout": "baseline", #
-                                    "spacing": "sm", #
-                                    "contents": [ #
-                                        {
-                                            "type": "text", #
-                                            "text": "邀請碼：", #
-                                            "color": "#aaaaaa", #
-                                            "size": "sm", #
-                                            "flex": 2, #
-                                        },
-                                        {
-                                            "type": "text", #
-                                            "text": invite_code, #
-                                            "wrap": True, #
-                                            "color": "#666666", #
-                                            "size": "sm", #
-                                            "flex": 5, #
-                                            "weight": "bold", #
-                                        },
-                                    ],
-                                }
-                            ],
-                        },
-                        {
-                            "type": "button", #
-                            "action": { #
-                                "type": "postback", #
-                                "label": "分享給家人", #
-                                "data": f"action=share_invite&code={invite_code}", #
-                                "displayText": "點擊複製邀請連結", #
-                            },
-                            "style": "primary", #
-                            "color": "#00B900", #
-                            "margin": "xl", #
-                        },
-                    ],
-                },
-                "footer": { #
-                    "type": "box", #
-                    "layout": "vertical", #
-                    "contents": [ #
-                        {
-                            "type": "text", #
-                            "text": "點擊上方按鈕獲取邀請訊息", #
-                            "size": "xs", #
-                            "color": "#aaaaaa", #
-                            "align": "center", #
-                            "margin": "md", #
-                        }
-                    ],
-                },
-            },
-        )
+        # 修改點：patient 表格是 recorder_id 和 member
+        cursor.execute("SELECT member FROM patients WHERE recorder_id = %s ORDER BY member", (recorder_id_for_db,))
+        existing_patients = cursor.fetchall()
 
-        line_bot_api.reply_message(event.reply_token, flex_message) #
-        return
+        if not existing_patients:
+            return TextSendMessage(text="您目前沒有任何用藥對象可以查看提醒。")
 
-    if text == "我的藥單": #
-        reply_text = text #
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text)) #
-        return 
+        for patient in existing_patients:
+            items.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label=f"查看「{patient['member']}」",
+                        data=f"action=show_reminders_for_member&member={quote(patient['member'])}", # 修改 action data
+                        display_text=f"查看「{patient['member']}」的提醒"
+                    )
+                )
+            )
+        return TextSendMessage(text="請選擇您想查看提醒的家人：", quick_reply=QuickReply(items=items))
 
-    if text == "藥品查詢": #
-        reply_text = text #
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text)) #
-        return
-
-    if text == "我的藥歷": #
-        reply_text = text #
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text)) #
-        return
-
-    if text == "我的健康紀錄": #
-        reply_text = text #
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text)) #
-        return
-
-    # 預設訊息
-    line_bot_api.reply_message(
-        event.reply_token, TextSendMessage(text="請透過主選單選取相關功能進行操作") #
-    )
-    return
+    except Exception as e:
+        print(f"Error in create_patient_selection_for_reminders_view: {e}")
+        return TextSendMessage(text="抱歉，在讀取用藥者資訊時發生錯誤。")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()

@@ -8,19 +8,22 @@ from linebot.models import (
     QuickReply, QuickReplyButton,
     MessageAction, URIAction,
     DatetimePickerAction,
-    PostbackAction
+    PostbackAction,
+    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, ButtonComponent, SeparatorComponent
 )
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs # Import parse_qs
 from handlers.message_handler import handle_text_message
-from medication_reminder import handle_medication_command, handle_postback
-from medication_reminder import add_medication_reminder
+from medication_reminder import handle_postback, create_patient_selection_message, get_patient_id_by_member_name, create_medication_management_menu, create_patient_edit_message # Import new functions
 from scheduler import start_scheduler
 from models import (
-    generate_invite_code, bind_family, get_user_by_line_id,
+    generate_invite_code, bind_family,
     create_user_if_not_exists, get_family_members,
     set_temp_state, clear_temp_state, get_temp_state,
-    get_medicine_id_by_name
+    get_medicine_id_by_name, add_medication_reminder_full
 )
+from database import get_conn # Assuming get_conn is in database.py
+import json
+import traceback # For better error logging
 
 # 導入 OCR 解析模組
 from medication_ocr_parser import call_ocr_service, parse_medication_order, convert_frequency_to_times
@@ -29,238 +32,75 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-@handler.add(FollowEvent)
-def handle_follow(event):
-    """
-    處理使用者首次加入好友事件。
-    """
-    user_id = event.source.user_id
-    print(f"✅ 使用者 {user_id} 加入好友")
-    create_user_if_not_exists(user_id)
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text="歡迎加入！\n\n請輸入「綁定邀請碼」來綁定家庭帳號\n或輸入「產生邀請碼」建立您的家庭。")
-    )
+# Helper to reply messages
+def reply_message(reply_token, messages):
+    try:
+        if not isinstance(messages, list):
+            messages = [messages]
+        line_bot_api.reply_message(reply_token, messages)
+    except LineBotApiError as e:
+        app.logger.error(f"LINE Bot API Error: {e.status_code} {e.error.message}")
+        app.logger.error(f"Details: {e.error.details}")
+        traceback.print_exc()
 
-@handler.add(JoinEvent)
-def handle_join(event):
-    """
-    處理 Bot 被邀請加入群組事件。
-    """
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text="感謝邀請我加入群組！我是一個用藥提醒機器人。")
-    )
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    """
-    處理所有文字訊息。
-    """
-    user_id = event.source.user_id
-    text = event.message.text.strip()
-    print(f"收到來自 {user_id} 的訊息: {text}")
-
-    # 委託給 medication_reminder 模組處理用藥提醒相關指令 (文字指令)
-    if handle_medication_command(event, line_bot_api):
-        return
-
-    # --- 藥袋辨識相關的文字指令處理 ---
-    if text == "藥袋辨識" or text == "上傳藥單": # 支援兩種觸發方式，符合流程圖和現有程式碼
-        set_temp_state(user_id, {'state': 'awaiting_med_order_image'})
-        # 流程圖中的提示訊息
-        message = (
-            "請拍攝藥袋照片。\n\n"
-            "為了幫助我們準確辨識藥品，請依照以下建議拍攝：\n"
-            "1. 請確保照片清晰且對焦正確\n"
-            "2. 避免遮擋藥袋上的任何資訊\n"
-            "3. 建議將藥袋平放拍攝，避免傾斜以利辨識"
-        )
-        # 流程圖中包含「開啟相機」和「打開相簿」的按鈕，
-        # 這裡由於 LINE Bot 圖片上傳本身就支援這兩種方式，不需要額外按鈕。
-        # 實際應用中，可以考慮使用 Flex Message 呈現更美觀的提示和說明。
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
-        return
-    elif text == "取消藥單設定":
-        clear_temp_state(user_id)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消藥單設定流程。"))
-        return
-
-    # 委託給通用的 message_handler 處理其他訊息
-    handle_text_message(event, line_bot_api)
-
-
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    """
-    處理所有圖片訊息，特別是藥袋辨識流程中的圖片上傳。
-    """
-    user_id = event.source.user_id
-    temp_state = get_temp_state(user_id)
-    print(f"DEBUG: 收到來自 {user_id} 的圖片。目前暫存狀態: {temp_state}")
-
-    # 檢查使用者是否處於等待藥袋圖片的狀態
-    if temp_state and temp_state.get('state') == 'awaiting_med_order_image':
-        try:
-            # 獲取圖片的二進制數據
-            message_content = line_bot_api.get_message_content(event.message.id)
-            image_data = message_content.content # 獲取圖片的二進制數據
-
-            # 1. 調用 OCR 服務
-            # 這裡會調用 medication_ocr_parser 中的模擬函式，實際應替換為真實的 OCR API 調用
-            ocr_raw_text = call_ocr_service(image_data)
-
-            if not ocr_raw_text or ocr_raw_text.strip() == "":
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法從圖片中辨識出文字，請嘗試更清晰的圖片或手動設定。"))
-                clear_temp_state(user_id)
-                return
-
-            # 2. 解析 OCR 辨識結果
-            parsed_meds = parse_medication_order(ocr_raw_text) # 調用 medication_ocr_parser 中的解析函式
-
-            if not parsed_meds:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 成功辨識文字，但無法解析藥品資訊。請檢查藥單格式或手動設定。"))
-                clear_temp_state(user_id)
-                return
-
-            # 3. 將解析結果暫存，並引導用戶確認
-            temp_state['parsed_medications'] = parsed_meds
-            temp_state['state'] = 'confirming_med_order' # 設定新狀態來處理確認流程
-            set_temp_state(user_id, temp_state)
-
-            # 構建確認訊息
-            confirm_message_lines = ["✅ 辨識結果如下："]
-            # 流程圖中提到看診日期和發藥天數，可以在這裡顯示
-            # 這裡從 OCR 模擬結果中直接提取，如果你想從 parse_medication_order 返回更詳細的資訊，可以在那裡修改
-            # 為了簡潔，這裡只顯示藥品列表
-            
-            confirm_message_lines.append("\n藥品名稱 | 單次劑量 | 用藥頻率 | 主要用途 | 副作用")
-            confirm_message_lines.append("---|---|---|---|---")
-
-            for med in parsed_meds:
-                # 為了更好的顯示，處理可能為空的副作用
-                side_effects_display = med['side_effects'] if med['side_effects'] else "無"
-                confirm_message_lines.append(
-                    f"{med['name']} | {med['dosage']} | {med['frequency_text']} | {med['purpose']} | {side_effects_display}"
-                )
-            
-            confirm_message_lines.append("\n請確認資訊是否正確？")
-
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text="\n".join(confirm_message_lines),
-                    quick_reply=QuickReply(items=[
-                        QuickReplyButton(action=PostbackAction(label="✅ 是，存入藥歷", data="action=confirm_med_order")),
-                        QuickReplyButton(action=MessageAction(label="❌ 否，重新辨識", text="取消藥單設定")) # 重新辨識可以引導回取消設定
-                    ])
-                )
-            )
-        except Exception as e:
-            print(f"Error processing image message: {e}")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="處理圖片時發生錯誤，請稍後再試。"))
-            clear_temp_state(user_id)
-    else:
-        # 如果不是在等待藥單圖片的狀態，則提示用戶
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="如果您要設定藥單提醒，請先輸入「藥袋辨識」或「上傳藥單」。"))
-
-@handler.add(PostbackEvent)
-def handle_postback_event(event):
-    """
-    處理所有 Postback 事件。
-    """
-    data = event.postback.data
-    user_id = event.source.user_id
-    temp_state = get_temp_state(user_id) # 重新獲取狀態以防在 handle_medication_postback 之前被修改
-
-    # 委託給 medication_reminder 模組的 handle_postback 處理所有與用藥提醒相關的 Postback
-    if handle_postback(event, line_bot_api):
-        return
-    
-    # --- 藥單確認流程的 Postback 處理 ---
-    if data == "action=confirm_med_order" and temp_state and temp_state.get('state') == 'confirming_med_order':
-        parsed_medications = temp_state.get('parsed_medications', [])
-        
-        if not parsed_medications:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 沒有可設定的藥品資訊。請重新上傳藥單。"))
-            clear_temp_state(user_id)
-            return
-
-        success_count = 0
-        fail_count = 0
-        details = []
-
-        for med in parsed_medications:
-            med_name = med['name']
-            dosage = med['dosage']
-            frequency_text = med['frequency_text'] # 使用原始頻率描述作為頻率字段
-            times_to_set = med['times'] # 這是已經轉換為 HH:MM 的時間列表
-            
-            # 對於「需要時服用」這種情況，可以特別處理，不設定具體提醒時間
-            if "需要時服用" in frequency_text or "需要時" in frequency_text:
-                details.append(f"❗ 藥品「{med_name}」為「{frequency_text}」，未設定固定提醒時間。")
-                continue # 跳過此藥品的具體時間設定
-
-            # 如果沒有解析到具體時間，給予提示
-            if not times_to_set:
-                details.append(f"❗ 藥品「{med_name}」的時段「{frequency_text}」無法解析為具體時間，請手動設定。")
-                fail_count += 1
-                continue
-
-            # 針對每個具體時間設定提醒
-            for single_time in set(times_to_set): # 使用 set 避免重複時間
-                try:
-                    # 假設 get_medicine_id_by_name 能夠根據藥品名稱獲取一個系統內的 ID
-                    # 如果你的系統沒有預設藥品 ID，你需要調整這裡的邏輯，
-                    # 例如直接使用藥品名稱，或者在 add_medication_reminder 內部處理新藥品。
-                    medicine_id = get_medicine_id_by_name(med_name) # 假設這個函式能找到藥品ID
-
-                    if medicine_id:
-                        add_medication_reminder(user_id, medicine_id, single_time, dosage, frequency_text)
-                        details.append(f"✅ {med_name} 在 {single_time} 設定成功。")
-                        success_count += 1
-                    else:
-                        details.append(f"❌ 無法為藥品「{med_name}」找到對應的 ID，請確保藥品已存在於系統中，或手動設定。")
-                        fail_count += 1
-                except Exception as e:
-                    details.append(f"❌ 設定 {med_name} 在 {single_time} 時失敗: {e}")
-                    fail_count += 1
-        
-        final_message = f"藥單提醒設定完成！\n成功：{success_count} 個\n失敗：{fail_count} 個\n\n詳細：\n" + "\n".join(details)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_message))
-        clear_temp_state(user_id) # 清除狀態，結束流程
-        return
-
-    # 處理來自 message_handler 的「分享給家人」Flex Message 觸發的 Postback
-    if data.startswith("action=share_invite"):
-        params = dict(item.split("=") for item in data.split("&")[1:])
-        invite_code = params.get('code', '')
-        
-        invite_link = f"https://line.me/R/ti/p/@651omrog?code={invite_code}"
-        share_text = (
-            f"【邀請連結】\n\n"
-            f"請點擊以下連結加入：\n"
-            f"{invite_link}\n\n"
-            f"邀請碼：{invite_code}"
-        )
-        
-        encoded_share_text = quote(share_text)
-        
-        share_message_reply = TextSendMessage(
-            text=share_text,
-            quick_reply=QuickReply(items=[
-                QuickReplyButton(
-                    action=MessageAction(label="產生邀請連結", text=invite_code)
+# ------------------------------------------------------------
+# Flex Message - 主用藥管理選單
+# ------------------------------------------------------------
+def create_main_medication_menu():
+    bubble = BubbleContainer(
+        direction='ltr',
+        hero=BoxComponent(
+            layout='vertical',
+            contents=[
+                TextComponent(text='用藥提醒小幫手', weight='bold', size='xl', align='center'),
+                TextComponent(text='請選擇功能：', size='sm', color='#666666', margin='md', align='center')
+            ],
+            padding_top='20px',
+            padding_bottom='10px'
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            contents=[
+                ButtonComponent(
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="使用說明", text="使用說明")
                 ),
-                QuickReplyButton(
-                    action=URIAction(label="分享給朋友", uri=f"line://msg/text/?{encoded_share_text}")
+                SeparatorComponent(margin='md'),
+                ButtonComponent( # 依照流程圖，將「選擇頻率」作為新增提醒的入口
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="選擇頻率 (新增提醒)", text="選擇頻率")
+                ),
+                ButtonComponent(
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="查詢用藥時間", text="查詢用藥時間")
+                ),
+                ButtonComponent(
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="修改用藥時間", text="修改時間")
+                ),
+                SeparatorComponent(margin='md'),
+                ButtonComponent(
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="用藥管理 (刪除/新增藥品)", text="用藥管理")
+                ),
+                ButtonComponent(
+                    style='link',
+                    height='sm',
+                    action=MessageAction(label="藥袋辨識", text="藥袋辨識")
                 )
-            ])
+            ],
+            padding_all='20px',
+            spacing='md'
         )
-        line_bot_api.reply_message(event.reply_token, share_message_reply)
-        return
+    )
+    return FlexSendMessage(alt_text="用藥提醒主選單", contents=bubble)
 
-@app.route("/", methods=['POST'])
+@app.route("/callback", methods=['POST'])
 def callback():
     """
     LINE Bot 的 webhook 接收點。
@@ -272,17 +112,197 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("Invalid signature. Please check your channel access token/channel secret.")
         abort(400)
+    except LineBotApiError as e:
+        app.logger.error(f"LINE Bot API Error: {e.status_code} {e.error.message}")
+        app.logger.error(f"Details: {e.error.details}")
+        abort(500)
     except Exception as e:
-        print(f"An error occurred: {e}")
+        app.logger.error(f"Webhook processing error: {e}")
+        traceback.print_exc()
         abort(500)
 
     return 'OK'
 
-if __name__ == "__main__":
-    # 確保你的 config.py 中有 CHANNEL_ACCESS_TOKEN 和 CHANNEL_SECRET
-    # 並且 medication_reminder, scheduler, models 模組也已準備好
-    start_scheduler(line_bot_api) # 啟動排程器，用於發送用藥提醒
-    app.run(host='0.0.0.0', port=5000)
 
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    reply_token = event.reply_token
+    line_user_id = event.source.user_id
+    message_text = event.message.text.strip()
+    current_state_info = get_temp_state(line_user_id) or {}
+    state = current_state_info.get("state")
+
+    if message_text == "提醒用藥主選單":
+        flex_message = create_main_medication_menu()
+        line_bot_api.reply_message(event.reply_token, flex_message)
+    elif message_text == "用藥管理":
+        reply_message(reply_token, create_medication_management_menu(line_user_id))
+    elif message_text == "新增用藥提醒":
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_REMINDER"})
+        reply_message(reply_token, create_patient_selection_message(line_user_id))
+     # ✅ 使用者選擇手動輸入藥品
+    elif message_text == "手動輸入藥品":
+        set_temp_state(line_user_id, {"state": "AWAITING_MEDICINE_NAME", "member": current_state_info.get("member")})
+        reply_message(reply_token, TextSendMessage(text="請輸入藥品名稱："))
+
+    # ✅ 使用者輸入藥品名稱
+    elif state == "AWAITING_MEDICINE_NAME":
+        medicine_name = message_text
+        set_temp_state(line_user_id, {
+            "state": "AWAITING_FREQUENCY_SELECTION",
+            "member": current_state_info.get("member"),
+            "medicine_name": medicine_name
+    })
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text=f"已輸入藥品：{medicine_name}\n請選擇用藥頻率：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=PostbackAction(label="每日一次", data="action=set_frequency_val&val=1_day")),
+                QuickReplyButton(action=PostbackAction(label="每日二次", data="action=set_frequency_val&val=2_day")),
+                QuickReplyButton(action=PostbackAction(label="每日三次", data="action=set_frequency_val&val=3_day")),
+                QuickReplyButton(action=PostbackAction(label="需要時", data="action=set_frequency_val&val=as_needed"))
+        ])
+    ))
+        
+    # ✅ 使用者輸入用藥天數
+    elif state == "AWAITING_DAYS_INPUT":
+        days_text = message_text.strip()
+        days = int(''.join(filter(str.isdigit, days_text))) if any(c.isdigit() for c in days_text) else 1
+        current_state_info["days"] = days
+        current_state_info["state"] = "AWAITING_TIME_SELECTION" 
+        set_temp_state(line_user_id, current_state_info)
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text=f"✅ 已設定為使用 {days} 天。請選擇每天服藥時間（或多個時間）～"
+        ))
+
+    # ✅ 接收用藥時間（可多次）直到使用者輸入 "完成"
+    elif state == "AWAITING_TIME_SELECTION":
+        times = current_state_info.get("times", [])
+        if message_text in ["完成", "ok", "OK"]:
+            if not times:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="尚未輸入任何時間，請至少輸入一個時間（例如 08:00）"))
+            else:
+                from models import add_medication_reminder_full
+                add_medication_reminder_full(
+                    line_user_id,
+                    current_state_info.get("member"),
+                    current_state_info.get("medicine_name"),
+                    current_state_info.get("frequency_code"),
+                    current_state_info.get("dosage"),
+                    current_state_info.get("days"),
+                    times
+                )
+                clear_temp_state(line_user_id)
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"✅ 提醒已建立成功：\n藥品：{current_state_info.get('medicine_name')}\n時間：{', '.join(times)}"
+                ))
+        else:
+            import re
+            if re.match(r"^\d{1,2}:\d{2}$", message_text):
+                times.append(message_text)
+                current_state_info["times"] = times
+                set_temp_state(line_user_id, current_state_info)
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"已加入時間：{message_text}。如需結束請輸入『完成』。"
+                ))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text="請輸入正確的時間格式（例如 08:00）或輸入『完成』來結束"
+                ))
+
+    # ✅ 補上 confirm_dosage_correct 動作也會切到 AWAITING_DAYS_INPUT
+    elif state == "AWAITING_DOSAGE_CONFIRM" and message_text in ["正確", "確定", "ok"]:
+        set_temp_state(line_user_id, {"state": "AWAITING_DAYS_INPUT", **current_state_info})
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入用藥天數，例如：7天、14天…"))
+
+    elif state == "AWAITING_NEW_PATIENT_NAME":
+        new_name = message_text
+        clear_temp_state(line_user_id)
+        conn = get_conn()
+        reply_text = "抱歉，資料庫連線失敗。"
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_user_id,))
+                user = cursor.fetchone()
+                if user:
+                    recorder_id_for_db = user[0]
+                    cursor.execute("SELECT COUNT(*) FROM patients WHERE recorder_id = %s AND member = %s", (recorder_id_for_db, new_name))
+                    if cursor.fetchone()[0] > 0: # 檢查計數是否大於 0
+                        reply_text = f"成員「{new_name}」已經存在囉！"
+                    else:
+                        cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (recorder_id_for_db, new_name))
+                        conn.commit()
+                        reply_text = f"好的，「{new_name}」已成功新增！"
+                else:
+                    reply_text = "抱歉，找不到您的使用者資料。"
+            except Exception as e:
+                app.logger.error(f"Error adding new patient: {e}")
+                traceback.print_exc()
+                reply_text = "新增成員失敗，請稍後再試。"
+            finally:
+                if conn.is_connected():
+                    conn.close()
+        reply_message(reply_token, TextSendMessage(text=reply_text))
+    elif state == "AWAITING_NEW_NAME":
+        new_name = message_text
+        member_to_edit = current_state_info.get("member_to_edit")
+        clear_temp_state(line_user_id)
+        conn = get_conn()
+        reply_text = "抱歉，資料庫連線失敗。"
+        if conn and member_to_edit:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE patients SET member = %s WHERE recorder_id = %s AND member = %s",
+                    (new_name, line_user_id, member_to_edit)
+                )
+                conn.commit()
+                if cursor.rowcount > 0:
+                    reply_text = f"名稱已成功修改為「{new_name}」！"
+                else:
+                    reply_text = "修改失敗，找不到該成員。" # 或成員名稱重複導致更新失敗
+            except Exception as e:
+                app.logger.error(f"Error editing patient name: {e}")
+                traceback.print_exc()
+                reply_text = "修改名稱失敗，請稍後再試。"
+            finally:
+                if conn.is_connected():
+                    conn.close()
+        reply_message(reply_token, TextSendMessage(text=reply_text))
+    else:
+        handle_text_message(event, line_bot_api)
+
+
+@handler.add(PostbackEvent)
+def handle_postback_event(event):
+    reply_token = event.reply_token
+    line_user_id = event.source.user_id
+    params = {k: v[0] for k, v in parse_qs(event.postback.data).items()}
+    action = params.get("action")
+    current_state_info = get_temp_state(line_user_id) or {}
+    state = current_state_info.get("state")
+
+    if action == "show_medication_management_menu":
+        reply_message(reply_token, create_medication_management_menu(line_user_id))
+    elif action == "select_patient_for_reminder":
+        handle_postback(event, line_bot_api, {})
+    elif action == "add_new_patient":
+        set_temp_state(line_user_id, {"state": "AWAITING_NEW_PATIENT_NAME"})
+        reply_message(reply_token, TextSendMessage(text="好的，請輸入您想新增的家人名稱："))
+    elif action == "edit_patient_start":
+        member_to_edit = params.get("member_to_edit")
+        if member_to_edit:
+            set_temp_state(line_user_id, {"state": "AWAITING_NEW_NAME", "member_to_edit": member_to_edit})
+            reply_message(reply_token, TextSendMessage(text="好的，請輸入新的名稱："))
+    elif action == "show_patient_edit_menu":
+        reply_message(reply_token, create_patient_edit_message(line_user_id))
+    else:
+        handle_postback(event, line_bot_api, {}) # 傳遞空字典或依據 handle_postback 的實際定義移除此參數
+
+
+# Start scheduler (assuming this is for background tasks)
+start_scheduler(line_bot_api)
+
+if __name__ == "__main__":
+    app.run()
