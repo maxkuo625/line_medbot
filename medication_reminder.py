@@ -127,7 +127,7 @@ def run_reminders(line_bot_api):
 # 用藥者管理相關功能
 # ------------------------------------------------------------
 
-def create_patient_selection_message(line_id: str):
+def create_patient_selection_message(line_id: str, context: str = None): # Modified signature
     conn = get_conn()
     if not conn:
         return TextSendMessage(text="抱歉，無法連接到使用者資料庫。")
@@ -140,33 +140,41 @@ def create_patient_selection_message(line_id: str):
         if not user:
             cursor.execute("INSERT INTO users (recorder_id, user_name) VALUES (%s, %s)", (line_id, "新用戶"))
             conn.commit()
-            current_recorder_id = line_id # 直接使用 line_id 作為 recorder_id
+            current_recorder_id = line_id
             
-            # 插入 patients 表時，使用 recorder_id 作為 line_id
             cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
             conn.commit()
             existing_patients = [{'member': '本人'}]
         else:
-            # 從 existing user 字典中獲取 recorder_id
-            current_recorder_id = user['recorder_id'] 
-            
-            # 查詢 patients 表時，使用 recorder_id
-            cursor.execute("SELECT member FROM patients WHERE recorder_id = %s", (current_recorder_id,)) # 移除了 ORDER BY patient_id，因為 patients 表沒有 patient_id 欄位
+            current_recorder_id = user['recorder_id']
+            cursor.execute("SELECT member FROM patients WHERE recorder_id = %s", (current_recorder_id,))
             existing_patients = cursor.fetchall()
             
-            # 如果沒有現有用藥者，新增「本人」，使用 recorder_id
             if not existing_patients:
                 cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
                 conn.commit()
                 existing_patients = [{'member': '本人'}]
 
         for patient in existing_patients:
+            postback_data = f"action=select_patient_for_reminder&member={quote(patient['member'])}"
+            display_text_label = f"選擇 {patient['member']}" # Default display text
+
+            if context: # Only append context if it's provided
+                postback_data += f"&context={context}"
+
+            if context == "add_reminder":
+                display_text_label = f"為「{patient['member']}」新增提醒"
+            elif context == "query_reminder":
+                display_text_label = f"查詢「{patient['member']}」的提醒"
+            elif context == "manage_reminders":
+                display_text_label = f"管理「{patient['member']}」的提醒"
+
             items.append(
                 QuickReplyButton(
                     action=PostbackAction(
                         label=patient['member'],
-                        data=f"action=select_patient_for_reminder&member={patient['member']}",
-                        display_text=f"為「{patient['member']}」分析"
+                        data=postback_data,
+                        display_text=display_text_label
                     )
                 )
             )
@@ -189,7 +197,13 @@ def create_patient_selection_message(line_id: str):
         if conn and conn.is_connected():
             conn.close()
 
-    return TextSendMessage(text="請問這份藥單是給誰的？", quick_reply=QuickReply(items=items))
+    return TextSendMessage(
+        text="請問這份藥單是給誰的？" if context == "add_reminder" else
+             "請問您想查詢誰的用藥時間？" if context == "query_reminder" else
+             "請問您想管理誰的用藥提醒？" if context == "manage_reminders" else
+             "請選擇用藥對象：", # Default if context is not specifically handled
+        quick_reply=QuickReply(items=items)
+    )
 
 def create_medication_management_menu(line_id: str):
     items = [
@@ -245,7 +259,7 @@ def create_patient_edit_message(line_id: str):
     items = []
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_id,))
+        cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_id,))
         user = cursor.fetchone()
         if not user:
             return TextSendMessage(text="找不到您的使用者資料。")
@@ -273,26 +287,70 @@ def create_patient_edit_message(line_id: str):
     return TextSendMessage(text="請問您想修改哪一位家人的名稱？", quick_reply=QuickReply(items=items))
 
 
-def get_patient_id_by_member_name(line_id: str, member_name: str) -> bool:
+def get_patient_id_by_member_name(line_id: str, member_name: str):
     conn = get_conn()
     if not conn:
         return None
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_id,))
-        user = cursor.fetchone()
-        if not user:
-            return None
-        recorder_id_for_query = user[0]
-        cursor.execute("SELECT COUNT(*) FROM patients WHERE recorder_id = %s AND member = %s", (recorder_id_for_query, member_name))
-        patient = cursor.fetchone()
-        return patient[0] if patient else None
+        # Change: Removed patient_id selection. We only need to confirm existence.
+        cursor.execute("SELECT recorder_id FROM patients WHERE recorder_id = %s AND member = %s", (line_id, member_name))
+        patient_record = cursor.fetchone()
+        # Return True if patient exists, False otherwise
+        return True if patient_record else False
     except Exception as e:
         logging.error(f"Error in get_patient_id_by_member_name: {e}")
         return None
     finally:
         if conn and conn.is_connected():
             conn.close()
+
+
+def _display_medication_reminders(reply_token, line_bot_api, line_user_id, member):
+    conn = get_conn()
+    if not conn:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，資料庫連線失敗。"))
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT recorder_id, member FROM patients WHERE recorder_id = %s AND member = %s", (line_user_id, member))
+        patient = cursor.fetchone()
+        if not patient:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
+            return
+
+        reminders = get_medication_reminders_for_user(line_user_id, member)
+        if not reminders:
+            message = TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。")
+        else:
+            reminder_messages = []
+            for r in reminders:
+                medicine_name = r.get('medicine_name', '未知藥品')
+                frequency_name = r.get('frequency_name', '未知頻率')
+                dose_quantity = r.get('dose_quantity', '未設定')
+                dosage_unit = r.get('dosage_unit', '')
+                reminder_time = r.get('reminder_time', '未設定時間')
+
+                reminder_messages.append(f"藥品：{medicine_name}\n頻率：{frequency_name}\n劑量：{dose_quantity}{dosage_unit}\n時間：{reminder_time}")
+            message = TextSendMessage(
+                text=f"「{member}」的用藥提醒：\n" + "\n---\n".join(reminder_messages),
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(
+                        action=PostbackAction(label="刪除提醒", data=f"action=delete_reminder_for_member&member={quote(member)}")
+                    )
+                ])
+            )
+        line_bot_api.reply_message(reply_token, message)
+        clear_temp_state(line_user_id)
+    except Exception as e:
+        logging.error(f"Error displaying reminders for member {member}: {e}")
+        import traceback
+        traceback.print_exc()
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="查詢提醒失敗，請稍後再試。"))
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
 
 # ------------------------------------------------------------
 # 處理 OCR 辨識結果並引導使用者設定提醒 (Existing code)
@@ -454,22 +512,39 @@ def handle_postback(event, line_bot_api, user_states):
     postback_data = event.postback.data
     params = {k: v[0] for k, v in parse_qs(postback_data).items()}
     action = params.get("action")
+    context = params.get("context") # Get the context
     current_state_info = get_temp_state(line_user_id) # Using get_temp_state from models
 
     if action == "select_patient_for_reminder":
         member = params.get('member')
         if member:
-            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
-            line_bot_api.reply_message(reply_token, TextSendMessage(
-                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
-                quick_reply=QuickReply(items=[
-                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品"))
-                ])
-            ))
+            if context == "query_reminder":
+                # User selected patient for query
+                _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+            elif context == "add_reminder": # Or if context is None, default to add_reminder
+                # User selected patient for adding a reminder (OCR or manual)
+                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                    quick_reply=QuickReply(items=[
+                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                    ])
+                ))
+            else: # Fallback for unclear context, perhaps a new scenario or old state
+                # Default to the "add reminder" flow if context is ambiguous or not provided
+                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                    quick_reply=QuickReply(items=[
+                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                    ])
+                ))
         else:
             line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
     elif action == "select_patient_for_reminder_initial": # This action is from the "用藥管理" menu to initiate patient selection
-        line_bot_api.reply_message(reply_token, create_patient_selection_message(line_user_id))
+        line_bot_api.reply_message(reply_token, create_patient_selection_message(line_user_id, context="manage_reminders")) # Modified call
     elif action == "set_frequency":
         set_temp_state(line_user_id, {"state": "AWAITING_FREQUENCY_SELECTION", **current_state_info})
         line_bot_api.reply_message(reply_token, TextSendMessage(
@@ -581,7 +656,6 @@ def handle_postback(event, line_bot_api, user_states):
         ))
     elif action == "confirm_days_correct":
         # Final step for adding medication reminder
-        # ... (logic to add reminder to DB)
         add_medication_reminder_full(line_user_id, current_state_info)
         line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥提醒已成功新增！"))
         clear_temp_state(line_user_id)
@@ -642,45 +716,7 @@ def handle_postback(event, line_bot_api, user_states):
     # Handle reminder management actions
     elif action.startswith("show_reminders_"):
         member = action.split("_")[2] # Extract member from action string
-        conn = get_conn()
-        if not conn:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，資料庫連線失敗。"))
-            return
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_user_id,))
-            user = cursor.fetchone()
-            if not user:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到您的使用者資料。"))
-                return
-            user_id = user['user_id']
-            cursor.execute("SELECT patient_id FROM patients WHERE user_id = %s AND member = %s", (user_id, member))
-            patient = cursor.fetchone()
-            if not patient:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
-                return
-            patient_id = patient['patient_id']
-
-            reminders = get_medication_reminders_for_user(patient_id)
-            if not reminders:
-                message = TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。")
-            else:
-                reminder_messages = []
-                for r in reminders:
-                    reminder_messages.append(f"藥品：{r['medicine_name']}, 頻率：{r['frequency_name']}, 劑量：{r['dose_quantity']}{r['dosage_unit']}, 時間：{r['reminder_time']}")
-                message = TextSendMessage(text=f"「{member}」的用藥提醒：\n" + "\n".join(reminder_messages),
-                                          quick_reply=QuickReply(items=[
-                                              QuickReplyButton(
-                                                  action=PostbackAction(label="刪除提醒", data=f"action=delete_reminder_for_member&member={member}")
-                                              )
-                                          ]))
-            line_bot_api.reply_message(reply_token, message)
-        except Exception as e:
-            logging.error(f"Error showing reminders for member {member}: {e}")
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="查詢提醒失敗，請稍後再試。"))
-        finally:
-            if conn.is_connected():
-                conn.close()
+        _display_medication_reminders(reply_token, line_bot_api, line_user_id, member) # Call helper function
 
     elif action == "delete_reminder_for_member":
         member = params.get('member')
@@ -694,13 +730,14 @@ def handle_postback(event, line_bot_api, user_states):
             return
         try:
             cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT user_id FROM users WHERE recorder_id = %s", (line_user_id,))
+            cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_user_id,))
             user = cursor.fetchone()
             if not user:
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到您的使用者資料。"))
                 return
-            user_id = user['user_id']
-            cursor.execute("SELECT patient_id FROM patients WHERE user_id = %s AND member = %s", (user_id, member))
+            # Using line_user_id directly for patients table now
+            # user_id = user['user_id'] # This line is no longer needed to find patient_id
+            cursor.execute("SELECT patient_id FROM patients WHERE recorder_id = %s AND member = %s", (line_user_id, member))
             patient = cursor.fetchone()
             if not patient:
                 line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))

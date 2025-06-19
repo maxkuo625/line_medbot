@@ -34,6 +34,51 @@ from medication_reminder import (
 
 from database import get_conn # 確保導入 get_conn
 
+def create_usage_instructions_message():
+    instructions = """
+    「用藥提醒小幫手」功能說明：
+
+    1. *新增用藥提醒：*
+       - 點擊主選單中的「新增用藥提醒」。
+       - 選擇您想設定提醒的家人。
+       - 如果沒有家人，請先點擊「新增家人」。
+       - 選擇提醒方式（手動輸入或上傳藥單照片）。
+       - 依照指示輸入藥物名稱、頻率、時間和劑量。
+       - 確認資訊後，用藥提醒就會設定完成。
+
+    2. *用藥管理：*
+       - 點擊主選單中的「用藥管理」。
+       - 您可以選擇「編輯家人資料」來修改家人名稱。
+       - 您也可以選擇「查看用藥提醒」來瀏覽已設定的提醒。
+       - 在「查看用藥提醒」中，您可以選擇「修改提醒」或「刪除提醒」。
+
+    3. *用藥記錄：*
+       - 點擊主選單中的「用藥記錄」。
+       - 選擇您想記錄用藥的家人。
+       - 選擇用藥日期、輸入藥物名稱、選擇劑量和用藥時間。
+       - 確認後，該次用藥記錄將會被儲存。
+
+    4. *查看提醒：*
+       - 點擊主選單中的「查看提醒」。
+       - 選擇您想查看提醒的家人，系統將列出該家人的所有用藥提醒。
+
+    5. *邀請家人：*
+       - 點擊主選單中的「邀請家人」。
+       - 系統會生成一個邀請碼，將此邀請碼分享給您的家人。
+       - 家人綁定後，您就可以為他們設定用藥提醒和記錄。
+
+    6. *綁定家人：*
+       - 點擊主選單中的「綁定家人」。
+       - 輸入您從家人那裡獲得的邀請碼，即可綁定成功。
+
+    7. *聯絡我們：*
+       - 點擊主選單中的「聯絡我們」。
+       - 您將會看到開發團隊的聯絡資訊。
+
+    如有其他問題，請隨時聯繫我們。
+    """
+    return TextSendMessage(text=instructions)
+
 # 修改 handle_text_message 的函數簽名，移除 user_states
 def handle_text_message(event, line_bot_api):
     reply_token = event.reply_token
@@ -89,6 +134,13 @@ def handle_text_message(event, line_bot_api):
 
 
     # 處理一般文字訊息
+
+     # 新增處理「使用說明」的邏輯
+    if message_text == "使用說明":
+        message = create_usage_instructions_message()
+        line_bot_api.reply_message(reply_token, message)
+        return
+    
     if message_text == "綁定":
         # 修改點：使用 set_temp_state
         set_temp_state(line_user_id, {"state": "AWAITING_INVITE_CODE"})

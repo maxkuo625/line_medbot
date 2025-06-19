@@ -141,6 +141,9 @@ def handle_message(event):
     elif message_text == "新增用藥提醒":
         set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_REMINDER"})
         reply_message(reply_token, create_patient_selection_message(line_user_id))
+    elif message_text == "查詢用藥時間": # 新增此判斷
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_QUERY"}) # 設定新狀態
+        reply_message(reply_token, create_patient_selection_message(line_user_id, context="query_reminder"))
      # ✅ 使用者選擇手動輸入藥品
     elif message_text == "手動輸入藥品":
         set_temp_state(line_user_id, {"state": "AWAITING_MEDICINE_NAME", "member": current_state_info.get("member")})

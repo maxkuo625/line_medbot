@@ -448,9 +448,9 @@ def delete_medication_reminder_time(recorder_id, member, frequency_name, time_sl
 # ------------------------------------------------------------
 # 查詢用藥提醒
 # ------------------------------------------------------------
-def get_medication_reminders_for_user(line_user_id):
+def get_medication_reminders_for_user(line_user_id, member): # 增加 member 參數
     """
-    獲取指定 Line 用戶的所有用藥提醒 (包括自己和家庭成員)。
+    獲取指定 Line 用戶和成員的所有用藥提醒。
     從 medication_record 中獲取藥品名稱，並透過 drug_name_zh 連接 drug_info。
     """
     conn = get_conn()
@@ -463,7 +463,7 @@ def get_medication_reminders_for_user(line_user_id):
         query = """
         SELECT
             p.member,
-            mr.drug_name_zh AS medicine_name, -- 直接從 medication_record 獲取藥品名稱
+            mr.drug_name_zh AS medicine_name,
             mr.dose_quantity,
             mr.dosage_unit,
             rt.frequency_name,
@@ -479,16 +479,14 @@ def get_medication_reminders_for_user(line_user_id):
         JOIN
             reminder_time rt ON p.recorder_id = rt.recorder_id AND p.member = rt.member
         WHERE
-            p.recorder_id = %s -- 查詢當前用戶的用藥者
-            -- 如果需要根據 drug_info 獲取額外資訊，可以使用 LEFT JOIN
-            -- LEFT JOIN drug_info di ON mr.drug_name_zh = di.drug_name_zh
+            p.recorder_id = %s AND p.member = %s -- 增加篩選條件：member
         ORDER BY
             p.member, rt.frequency_name;
         """
-        cursor.execute(query, (line_user_id,))
+        cursor.execute(query, (line_user_id, member)) # 傳入 line_user_id 和 member
         return cursor.fetchall()
     except Exception as e:
-        logging.error(f"ERROR: Failed to get medication reminders for user {line_user_id}: {e}")
+        logging.error(f"ERROR: Failed to get medication reminders for user {line_user_id} and member {member}: {e}")
         return []
     finally:
         cursor.close()
