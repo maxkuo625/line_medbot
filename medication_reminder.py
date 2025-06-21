@@ -79,13 +79,13 @@ def run_reminders(line_bot_api):
             fc.frequency_name,
             mr.dose_quantity,
             mr.dosage_unit,
-            di.drug_name_zh AS medicine_name
+            COALESCE(di.drug_name_zh, mr.drug_name_zh) AS medicine_name
         FROM
             reminder_time rt
         JOIN
             medication_record mr ON rt.recorder_id = mr.recorder_id
-                               AND rt.member = mr.member
-                               AND rt.frequency_name = mr.frequency_name
+                       AND rt.member = mr.member
+                       AND rt.frequency_name = mr.frequency_name
         LEFT JOIN drug_info di ON mr.drug_name_zh = di.drug_name_zh
         JOIN
             frequency_code fc ON rt.frequency_name = fc.frequency_name
@@ -95,7 +95,8 @@ def run_reminders(line_bot_api):
                 TIME(rt.time_slot_2),
                 TIME(rt.time_slot_3),
                 TIME(rt.time_slot_4)
-            );
+        );
+
         """
         cursor.execute(query, (current_time_str,))
         reminders_to_send = cursor.fetchall()
