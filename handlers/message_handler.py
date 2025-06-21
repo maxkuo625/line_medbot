@@ -1,8 +1,9 @@
 from linebot.models import (
-    TextSendMessage, FlexSendMessage,
-    QuickReply, QuickReplyButton,
-    MessageAction, URIAction,
-    PostbackAction, DatetimePickerAction
+    TextSendMessage, FlexSendMessage,QuickReply, 
+    QuickReplyButton,MessageAction, URIAction,
+    PostbackAction, DatetimePickerAction,FlexSendMessage, 
+    BubbleContainer, BoxComponent, TextComponent, 
+    ButtonComponent, SeparatorComponent
 )
 
 # 確保從 models 模組中導入所有需要的函數
@@ -10,14 +11,16 @@ from models import (
     create_user_if_not_exists,
     bind_family,
     generate_invite_code,
-    clear_temp_state,      # 確保導入 clear_temp_state
-    set_temp_state,        # 確保導入 set_temp_state
-    get_medication_reminders_for_user, # 確保導入 get_medication_reminders_for_user
-    get_temp_state # 確保導入 get_temp_state，用於檢查狀態
+    clear_temp_state,
+    set_temp_state,        
+    get_medication_reminders_for_user,
+    get_temp_state,
+    get_family_bindings,
+    unbind_family 
 )
 
 import re
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs
 
 # 從 medication_reminder 導入需要的函數
 from medication_reminder import (
@@ -79,18 +82,74 @@ def create_usage_instructions_message():
     """
     return TextSendMessage(text=instructions)
 
-# 修改 handle_text_message 的函數簽名，移除 user_states
 def handle_text_message(event, line_bot_api):
     reply_token = event.reply_token
     line_user_id = event.source.user_id
     message_text = event.message.text.strip()
-
-    # 修改點：使用 get_temp_state 獲取狀態，並使用 or {} 確保返回字典
     current_state = get_temp_state(line_user_id) or {}
     state = current_state.get("state")
 
+    if message_text == "產生邀請碼":
+        handle_invite_code_request(reply_token, line_user_id, line_bot_api)
+        return
+
+    elif message_text == "查詢家人":
+        bindings = get_family_bindings(line_user_id)
+        if not bindings:
+            reply = "您目前沒有綁定任何家人。"
+        else:
+            lines = [f"👤 [{b['role']}]：{b['user_id']}" for b in bindings]
+            reply = "📋 您的家人綁定如下：\n" + "\n".join(lines)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply))
+        return
+
+    elif message_text == "解除綁定":
+        bindings = get_family_bindings(line_user_id)
+        if not bindings:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="您目前沒有綁定任何家人。"))
+            return
+
+        buttons = []
+        for b in bindings:
+            label = f"{b['role']}:{b['user_id'][-6:]}"
+            buttons.append(QuickReplyButton(
+                action=PostbackAction(
+                    label=label,
+                    data=f"action=confirm_unbind&target={b['user_id']}"
+                )
+            ))
+
+        set_temp_state(line_user_id, {"state": "AWAITING_UNBIND_SELECTION"})
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請點選您想解除綁定的對象：",
+            quick_reply=QuickReply(items=buttons)
+        ))
+        return
+
+    elif message_text == "綁定":
+        set_temp_state(line_user_id, {"state": "AWAITING_INVITE_CODE"})
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="好的，請輸入您收到的邀請碼："))
+        return
+
+    elif state == "AWAITING_INVITE_CODE":
+        invite_code = message_text
+        clear_temp_state(line_user_id)
+        try:
+            success, bound_user_id = bind_family(invite_code, line_user_id)
+            if success:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"✅ 綁定成功！您已與帳號 {bound_user_id} 建立綁定。\n您現在可以輸入「新增用藥提醒」開始設定提醒。"
+                ))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 綁定失敗，邀請碼無效或已過期。"))
+        except Exception as e:
+            print(f"Error binding family: {e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 綁定過程中發生錯誤，請稍後再試。"))
+        return
+
+
     # 處理 OCR 辨識結果的訊息 (假設這是在圖片訊息後傳送的文本)
-    if state == "AWAITING_OCR_CONFIRMATION" and message_text in ["是", "否"]:
+    elif state == "AWAITING_OCR_CONFIRMATION" and message_text in ["是", "否"]:
         handle_ocr_recognition_result(reply_token, line_user_id, message_text, line_bot_api)
         return
 
@@ -207,6 +266,63 @@ def handle_text_message(event, line_bot_api):
         # 其他未知的文字訊息
         line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，我不太明白您的意思。您可以嘗試輸入「綁定」或「用藥管理」等指令。"))
 
+def handle_family_postback(event, line_bot_api):
+    reply_token = event.reply_token
+    line_user_id = event.source.user_id
+    data = event.postback.data
+    params = {k: v[0] for k, v in parse_qs(data).items()}
+    action = params.get("action")
+    current_state = get_temp_state(line_user_id) or {}
+    state = current_state.get("state")
+
+    if action == "confirm_unbind" and state == "AWAITING_UNBIND_SELECTION":
+        target_id = params.get("target")
+        success = unbind_family(line_user_id, target_id)
+        clear_temp_state(line_user_id)
+        if success:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"✅ 已解除與 {target_id[-6:]} 的綁定關係。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 解除失敗，請稍後再試。"))
+
+def handle_invite_code_request(reply_token, line_user_id, line_bot_api):
+
+    try:
+        invite_code, expires_at = generate_invite_code(line_user_id)
+    except Exception as e:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"❌ 無法產生邀請碼：{str(e)}"))
+        return
+
+    expires_str = expires_at.strftime('%Y/%m/%d %H:%M')
+    invite_link = f"https://line.me/R/oaMessage/@651omrog/?綁定%20{invite_code}"
+    encoded_link = quote(invite_link, safe='')
+
+    bubble = BubbleContainer(
+        direction="ltr",
+        body=BoxComponent(
+            layout="vertical",
+            contents=[
+                TextComponent(text="📨 邀請碼產生成功", weight="bold", size="lg", align="center"),
+                SeparatorComponent(margin="md"),
+                TextComponent(text=f"邀請碼：{invite_code}", size="md", margin="md"),
+                TextComponent(text=f"效期至：{expires_str}", size="sm", color="#888888"),
+                TextComponent(text="點擊分享按鈕來分享：", size="sm", margin="md"),
+                TextComponent(text=invite_link, wrap=True, size="sm", color="#0066cc"),
+                ButtonComponent(
+                    style="link",
+                    height="sm",
+                    action=URIAction(label="🔗 與親朋好友分享", uri=f"line://msg/text/?{encoded_link}")
+                )
+            ],
+            spacing="md",
+            padding_all="20px"
+        )
+    )
+
+    flex_msg = FlexSendMessage(alt_text="邀請碼產生成功", contents=bubble)
+    line_bot_api.reply_message(reply_token, [
+    flex_msg,
+    TextSendMessage(text="📌 提醒：請點擊上方連結後，在輸入框按下『傳送』鍵完成綁定。")
+])
 
 # 這是 create_patient_selection_for_reminders_view 的實現，用於「查看提醒」
 def create_patient_selection_for_reminders_view(line_id):

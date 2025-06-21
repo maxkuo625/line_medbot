@@ -108,10 +108,10 @@ def run_reminders(line_bot_api):
             for reminder in reminders_to_send:
                 line_user_id = reminder['line_user_id']
                 member = reminder['member']
-                medicine_name = reminder['medicine_name'] # 現在直接是 name_zh
-                dose_quantity = reminder.get('dose_quantity', '未設定') # 從 SQL 結果獲取，如果為 NULL 則為 '未設定'
+                medicine_name = reminder['medicine_name']
+                dose_quantity = reminder.get('dose_quantity', '未設定')
                 dosage_unit = reminder.get('dosage_unit', '')
-                frequency_name = reminder.get('frequency_name', '未設定頻率') # 如果 frequency_name 為 NULL，則顯示 '未設定頻率'
+                frequency_name = reminder.get('frequency_name', '未設定頻率')
 
                 display_time = datetime.now().strftime('%H:%M')
 

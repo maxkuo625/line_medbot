@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import logging
 import json
 import re
+from linebot.models import TextSendMessage
 
 logging.basicConfig(level=logging.INFO)
 
@@ -140,80 +141,101 @@ def get_family_members(recorder_id):
 # 🔗 邀請碼與家人綁定
 # ========================\
 
-def generate_invite_code(inviter_recorder_id):
-    """
-    為邀請者生成一個唯一的邀請碼。
-    """
+def generate_invite_code(elder_user_id, expire_minutes=60):
+    now = datetime.now()
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    conn = get_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            INSERT INTO invite_codes (inviter_recorder_id, code)
+    expires_at = now + timedelta(minutes=expire_minutes)
+
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO invite_codes (code, inviter_recorder_id, expires_at)
+            VALUES (%s, %s, %s)
+        """, (code, elder_user_id, expires_at))
+        conn.commit()
+        return code, expires_at
+
+
+def bind_family(invite_code, family_user_id):
+    from linebot import LineBotApi
+    from config import CHANNEL_ACCESS_TOKEN
+    line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+
+    with get_conn() as conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT * FROM invite_codes 
+            WHERE code=%s AND recipient_line_id IS NULL AND expires_at > NOW()
+        """, (invite_code,))
+        result = cursor.fetchone()
+        if not result:
+            return False, None
+
+        inviter = result['inviter_recorder_id']
+        invite_id = result['id']
+
+        cursor.execute("""
+            UPDATE invite_codes SET recipient_line_id=%s, bound_at=NOW()
+            WHERE id=%s
+        """, (family_user_id, invite_id))
+
+        cursor.execute("""
+            INSERT IGNORE INTO invitation_recipients (recorder_id, recipient_line_id)
             VALUES (%s, %s)
-            """, (inviter_recorder_id, code))
-        conn.commit()
-        print(f"DEBUG: Generated invite code {code} for inviter {inviter_recorder_id}")
-        return code
-    except Exception as e:
-        print(f"ERROR: Failed to generate invite code for {inviter_recorder_id}: {e}")
-        return None
-    finally:
-        cursor.close()
-        conn.close()
+        """, (inviter, family_user_id))
 
-def bind_family(invite_code, recipient_recorder_id, recipient_name=None, relation_type='未定義'):
-    """
-    將接收者與邀請碼綁定，建立家庭關係。
-    返回 (是否成功, 邀請者的 recorder_id 或 None)。
-    """
+        conn.commit()
+
+        # ✅ 綁定成功後通知邀請人
+        try:
+            line_bot_api.push_message(inviter, TextSendMessage(
+                text=f"✅ 您邀請的帳號（{family_user_id[-6:]}）已完成綁定 🎉"
+            ))
+        except Exception as e:
+            print(f"❗ 通知邀請人失敗：{e}")
+
+        return True, inviter
+
+
+def get_family_bindings(line_user_id):
+    conn = get_conn()
+    result = []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT '邀請他人' AS role, recipient_line_id AS user_id
+            FROM invitation_recipients
+            WHERE recorder_id = %s
+            UNION
+            SELECT '被邀請人' AS role, recorder_id AS user_id
+            FROM invitation_recipients
+            WHERE recipient_line_id = %s
+        """, (line_user_id, line_user_id))
+        result = cursor.fetchall()
+    except Exception as e:
+        print(f"ERROR: get_family_bindings 查詢失敗: {e}")
+    finally:
+        conn.close()
+    return result
+
+def unbind_family(line_user_id, target_user_id):
     conn = get_conn()
     cursor = conn.cursor()
-    inviter_recorder_id = None
     try:
-        cursor.execute(
-            "SELECT inviter_recorder_id FROM invite_codes WHERE code = %s AND bound_at IS NULL",
-            (invite_code,)
-        )
-        invite_info = cursor.fetchone()
-
-        if not invite_info:
-            print(f"INFO: Invalid or already used invite code: {invite_code}")
-            return False, None
-
-        inviter_recorder_id = invite_info[0]
-
-        cursor.execute(
-            "SELECT COUNT(*) FROM invitation_recipients WHERE inviter_recorder_id = %s AND recipient_line_id = %s",
-            (inviter_recorder_id, recipient_recorder_id)
-        )
-        if cursor.fetchone()[0] > 0:
-            print(f"INFO: Family binding already exists between {inviter_recorder_id} and {recipient_recorder_id}.")
-            return False, None
-
-        cursor.execute(
-            """
-            INSERT INTO invitation_recipients (inviter_recorder_id, recipient_line_id, recipient_name, relation_type)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (inviter_recorder_id, recipient_recorder_id, recipient_name, relation_type)
-        )
-
-        cursor.execute(
-            "UPDATE invite_codes SET bound_at = CURRENT_TIMESTAMP WHERE code = %s",
-            (invite_code,)
-        )
+        cursor.execute("""
+            DELETE FROM invitation_recipients
+            WHERE (recorder_id = %s AND recipient_line_id = %s)
+               OR (recorder_id = %s AND recipient_line_id = %s)
+        """, (line_user_id, target_user_id, target_user_id, line_user_id))
         conn.commit()
-        print(f"DEBUG: Successfully bound family: inviter {inviter_recorder_id} to recipient {recipient_recorder_id}")
-        return True, inviter_recorder_id
+        return cursor.rowcount > 0
     except Exception as e:
-        conn.rollback()
-        print(f"ERROR: Failed to bind family for invite code {invite_code} and recipient {recipient_recorder_id}: {e}")
-        return False, None
+        print(f"ERROR: unbind_family 解除失敗: {e}")
+        return False
     finally:
         cursor.close()
         conn.close()
+
 
 # ========================\
 # 💊 用藥提醒設定 (主要的修改部分)

@@ -7,10 +7,10 @@ from linebot.models import (
     PostbackEvent,QuickReply, QuickReplyButton,MessageAction, 
     URIAction,DatetimePickerAction,PostbackAction,FlexSendMessage, 
     BubbleContainer, BoxComponent, TextComponent, ButtonComponent, 
-    SeparatorComponent,TemplateSendMessage, ButtonsTemplate
+    SeparatorComponent,TemplateSendMessage, ButtonsTemplate, FollowEvent
 )
-from urllib.parse import quote, parse_qs # Import parse_qs
-from handlers.message_handler import handle_text_message
+from urllib.parse import parse_qs, quote
+from handlers.message_handler import handle_text_message, handle_family_postback
 from medication_reminder import (
     handle_postback, create_patient_selection_message, create_medication_management_menu, 
     create_patient_edit_message, create_frequency_quickreply)
@@ -98,6 +98,59 @@ def create_main_medication_menu():
     )
     return FlexSendMessage(alt_text="用藥提醒主選單", contents=bubble)
 
+def create_family_management_menu():
+    contents = [
+        ButtonComponent(
+            style="link",
+            height="sm",
+            action=MessageAction(label="🔗 產生邀請碼", text="產生邀請碼")
+        ),
+        ButtonComponent(
+            style="link",
+            height="sm",
+            action=MessageAction(label="📥 綁定家人", text="綁定")
+        ),
+        ButtonComponent(
+            style="link",
+            height="sm",
+            action=MessageAction(label="🔍 查詢家人", text="查詢家人")
+        ),
+        ButtonComponent(
+            style="link",
+            height="sm",
+            action=MessageAction(label="❌ 解除綁定", text="解除綁定")
+        )
+    ]
+
+    bubble = BubbleContainer(
+        direction="ltr",
+        body=BoxComponent(
+            layout="vertical",
+            contents=[
+                TextComponent(text="👨‍👩‍👧‍👦 家人管理選單", weight="bold", size="lg", align="center"),
+                SeparatorComponent(margin="md"),
+                *contents
+            ],
+            spacing="md",
+            padding_all="20px"
+        )
+    )
+
+    return FlexSendMessage(alt_text="家人管理選單", contents=bubble)
+
+def welcome_invited_user(reply_token, line_bot_api):
+    line_bot_api.reply_message(reply_token, [
+        TextSendMessage(text="👋 歡迎加入！請點選下方『家人管理選單』完成綁定流程。"),
+        create_family_management_menu()
+    ])
+
+@handler.add(FollowEvent)
+def handle_follow(event):
+    reply_token = event.reply_token
+    welcome_invited_user(reply_token, line_bot_api)
+
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     """
@@ -134,6 +187,8 @@ def handle_message(event):
     if message_text == "提醒用藥主選單":
         flex_message = create_main_medication_menu()
         line_bot_api.reply_message(event.reply_token, flex_message)
+    elif message_text == "家人管理":
+        line_bot_api.reply_message(reply_token, create_family_management_menu())
     elif message_text == "用藥管理":
         reply_message(reply_token, create_medication_management_menu(line_user_id))
     elif message_text == "新增用藥提醒":
@@ -318,6 +373,11 @@ def handle_postback_event(event):
     action = params.get("action")
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
+
+    if action in ["confirm_unbind"]:
+        handle_family_postback(event, line_bot_api)
+    else:
+        handle_postback(event, line_bot_api, {})
 
     # ✅ set_time 處理時間新增（根據 frequency_code 限制）
     if action == "set_time" and state == "AWAITING_TIME_SELECTION":
