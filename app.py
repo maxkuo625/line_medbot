@@ -4,16 +4,16 @@ from config import CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage, ImageMessage,
-    PostbackEvent, FollowEvent, JoinEvent,
-    QuickReply, QuickReplyButton,
-    MessageAction, URIAction,
-    DatetimePickerAction,
-    PostbackAction,
-    FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, ButtonComponent, SeparatorComponent
+    PostbackEvent,QuickReply, QuickReplyButton,MessageAction, 
+    URIAction,DatetimePickerAction,PostbackAction,FlexSendMessage, 
+    BubbleContainer, BoxComponent, TextComponent, ButtonComponent, 
+    SeparatorComponent,TemplateSendMessage, ButtonsTemplate
 )
 from urllib.parse import quote, parse_qs # Import parse_qs
 from handlers.message_handler import handle_text_message
-from medication_reminder import handle_postback, create_patient_selection_message, get_patient_id_by_member_name, create_medication_management_menu, create_patient_edit_message # Import new functions
+from medication_reminder import (
+    handle_postback, create_patient_selection_message, get_patient_id_by_member_name, 
+    create_medication_management_menu, create_patient_edit_message, create_frequency_quickreply)
 from scheduler import start_scheduler
 from models import (
     generate_invite_code, bind_family,
@@ -159,59 +159,94 @@ def handle_message(event):
     })
         line_bot_api.reply_message(reply_token, TextSendMessage(
             text=f"已輸入藥品：{medicine_name}\n請選擇用藥頻率：",
-            quick_reply=QuickReply(items=[
-                QuickReplyButton(action=PostbackAction(label="每日一次", data="action=set_frequency_val&val=1_day")),
-                QuickReplyButton(action=PostbackAction(label="每日二次", data="action=set_frequency_val&val=2_day")),
-                QuickReplyButton(action=PostbackAction(label="每日三次", data="action=set_frequency_val&val=3_day")),
-                QuickReplyButton(action=PostbackAction(label="需要時", data="action=set_frequency_val&val=as_needed"))
-        ])
+            quick_reply=create_frequency_quickreply()
     ))
+        
+    # ✅ 新增處理劑量輸入的狀態
+    elif state == "AWAITING_DOSAGE_INPUT":
+        dosage = message_text.strip()
+        if not dosage: # 簡單的驗證，避免空劑量
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="劑量不能為空，請重新輸入。"))
+            return
+
+        current_state_info["dosage"] = dosage
+        current_state_info["state"] = "AWAITING_DAYS_INPUT" # 假設劑量後直接進入天數輸入
+        set_temp_state(line_user_id, current_state_info)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已輸入劑量：{dosage}。請輸入用藥天數，例如：7天、14天…"))
         
     # ✅ 使用者輸入用藥天數
     elif state == "AWAITING_DAYS_INPUT":
-        days_text = message_text.strip()
-        days = int(''.join(filter(str.isdigit, days_text))) if any(c.isdigit() for c in days_text) else 1
-        current_state_info["days"] = days
-        current_state_info["state"] = "AWAITING_TIME_SELECTION" 
-        set_temp_state(line_user_id, current_state_info)
-        line_bot_api.reply_message(reply_token, TextSendMessage(
-            text=f"✅ 已設定為使用 {days} 天。請選擇每天服藥時間（或多個時間）～"
-        ))
+        days = message_text.strip()
+        if not days.replace("天", "").isdigit():
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的天數，例如 7天"))
+            return
 
-    # ✅ 接收用藥時間（可多次）直到使用者輸入 "完成"
+        current_state_info["days"] = days.replace("天", "")
+        current_state_info["state"] = "AWAITING_TIME_SELECTION"
+        current_state_info["times"] = []
+        set_temp_state(line_user_id, current_state_info)
+
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text="請選擇第一個提醒時間：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(
+                        action=DatetimePickerAction(
+                            label="➕ 選擇時間",
+                            data="action=set_time",
+                            mode="time"
+                        )
+                    ),
+                    QuickReplyButton(
+                        action=PostbackAction(
+                            label="✅ 完成",
+                            data="action=finish_time_selection"
+                        )
+                    )
+                ])
+            )
+        )
+
+
+    # ✅ 接收用藥時間（可多次
     elif state == "AWAITING_TIME_SELECTION":
-        times = current_state_info.get("times", [])
-        if message_text in ["完成", "ok", "OK"]:
-            if not times:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="尚未輸入任何時間，請至少輸入一個時間（例如 08:00）"))
-            else:
-                from models import add_medication_reminder_full
-                add_medication_reminder_full(
-                    line_user_id,
-                    current_state_info.get("member"),
-                    current_state_info.get("medicine_name"),
-                    current_state_info.get("frequency_code"),
-                    current_state_info.get("dosage"),
-                    current_state_info.get("days"),
-                    times
+        selected_times = current_state_info.get("times", [])
+        current_display = "、".join(selected_times) if selected_times else "無"
+
+    # 快速回覆選項：依照剩餘次數顯示
+        quick_items = []
+
+        if len(selected_times) < 4:
+            quick_items.append(
+                QuickReplyButton(
+                    action=DatetimePickerAction(
+                        label="➕ 選擇時間",
+                        data="action=set_time",
+                        mode="time"
+                    )
                 )
-                clear_temp_state(line_user_id)
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=f"✅ 提醒已建立成功：\n藥品：{current_state_info.get('medicine_name')}\n時間：{', '.join(times)}"
-                ))
-        else:
-            import re
-            if re.match(r"^\d{1,2}:\d{2}$", message_text):
-                times.append(message_text)
-                current_state_info["times"] = times
-                set_temp_state(line_user_id, current_state_info)
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=f"已加入時間：{message_text}。如需結束請輸入『完成』。"
-                ))
-            else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text="請輸入正確的時間格式（例如 08:00）或輸入『完成』來結束"
-                ))
+            )
+
+        quick_items.append(
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="✅ 完成",
+                    data="action=finish_time_selection"
+                )
+            )
+        )
+
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text=f"目前已選擇時間：{current_display}\n"
+                     f"{'最多可設定 4 個時間。' if len(selected_times) < 4 else '已達上限，請按完成繼續。'}",
+                quick_reply=QuickReply(items=quick_items)
+            )
+        )
+
+
 
     # ✅ 補上 confirm_dosage_correct 動作也會切到 AWAITING_DAYS_INPUT
     elif state == "AWAITING_DOSAGE_CONFIRM" and message_text in ["正確", "確定", "ok"]:
@@ -285,6 +320,173 @@ def handle_postback_event(event):
     action = params.get("action")
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
+
+    if action == "set_time" and state == "AWAITING_TIME_SELECTION":
+        selected_time = event.postback.params.get('time')  # 格式 "HH:MM"
+        times = current_state_info.get("times", [])
+
+        if selected_time in times:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text=f"⏰ {selected_time} 已經選過了，請選其他時間。")
+            )
+            return
+
+        if len(times) >= 4:
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text="⚠️ 已達時間設定上限（4個）。請按完成繼續。")
+            )
+            return
+
+        times.append(selected_time)
+        current_state_info["times"] = times
+        set_temp_state(line_user_id, current_state_info)
+
+        # 重新顯示時間選擇畫面（用 QuickReply）
+        selected_times = current_state_info.get("times", [])
+        current_display = "、".join(selected_times) if selected_times else "無"
+
+        quick_items = []
+
+        if len(selected_times) < 4:
+            quick_items.append(
+                QuickReplyButton(
+                    action=DatetimePickerAction(
+                        label="➕ 選擇時間",
+                        data="action=set_time",
+                        mode="time"
+                    )
+                )
+            )
+
+        # ✅ 為每個已選時間加入刪除按鈕
+        for t in selected_times:
+            quick_items.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label=f"🗑 刪除 {t}",
+                        data=f"action=delete_selected_time&time={t}"
+                    )
+                )
+            )
+
+        quick_items.append(
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="✅ 完成",
+                    data="action=finish_time_selection"
+                )
+            )
+        )
+
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text=f"✅ 已新增時間：{selected_time}\n目前已選擇：{current_display}",
+                quick_reply=QuickReply(items=quick_items)
+            )
+        )
+    
+    elif action == "delete_selected_time" and state == "AWAITING_TIME_SELECTION":
+        time_to_delete = params.get("time")
+        times = current_state_info.get("times", [])
+
+        if time_to_delete in times:
+            times.remove(time_to_delete)
+            current_state_info["times"] = times
+            set_temp_state(line_user_id, current_state_info)
+            msg = f"🗑 已刪除時間：{time_to_delete}"
+        else:
+            msg = f"⚠️ 找不到時間：{time_to_delete}"
+
+        # 回到時間選擇畫面
+        selected_times = current_state_info.get("times", [])
+        current_display = "、".join(selected_times) if selected_times else "無"
+
+        quick_items = []
+
+        if len(selected_times) < 4:
+            quick_items.append(
+                QuickReplyButton(
+                    action=DatetimePickerAction(
+                        label="➕ 選擇時間",
+                        data="action=set_time",
+                        mode="time"
+                    )
+                )
+            )
+
+        # 刪除按鈕 for each time
+        for t in selected_times:
+            quick_items.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label=f"🗑 刪除 {t}",
+                        data=f"action=delete_selected_time&time={t}"
+                    )
+                )
+            )
+
+        quick_items.append(
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="✅ 完成",
+                    data="action=finish_time_selection"
+                )
+            )
+        )
+
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text=f"{msg}\n\n目前已選時間：{current_display}",
+                quick_reply=QuickReply(items=quick_items)
+            )
+        )
+
+
+    # 新增處理「完成」按鈕的邏輯
+    elif action == "finish_time_selection" and state == "AWAITING_TIME_SELECTION":
+        times = current_state_info.get("times", [])
+        if not times:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="尚未輸入任何時間，請至少選擇一個時間。"))
+        else:
+            try:
+                required_fields = ["member", "medicine_name", "frequency_code", "dosage", "days"]
+                missing = [f for f in required_fields if not current_state_info.get(f)]
+                if missing:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(
+                        text=f"❗ 資料不完整，缺少欄位：{', '.join(missing)}，請重新設定提醒流程。"
+                    ))
+                    return
+
+                add_medication_reminder_full(
+                    recorder_id=line_user_id,
+                    member=current_state_info["member"],
+                    medicine_name=current_state_info["medicine_name"],
+                    frequency_code=current_state_info["frequency_code"],
+                    dosage=current_state_info["dosage"],
+                    days=current_state_info["days"],
+                    times=times
+                )
+
+                clear_temp_state(line_user_id)
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=(
+                        f"✅ 提醒已建立成功！\n"
+                        f"👤 用藥對象：{current_state_info['member']}\n"
+                        f"💊 藥品：{current_state_info['medicine_name']}\n"
+                        f"⏰ 頻率：{current_state_info['frequency_code']}\n"
+                        f"📆 天數：{current_state_info['days']}\n"
+                        f"🕒 時間：{', '.join(times)}"
+                    )
+                ))
+            except Exception as e:
+                app.logger.error(f"建立提醒失敗：{e}")
+                import traceback
+                traceback.print_exc()
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 建立提醒時發生錯誤，請稍後再試。"))
 
     if action == "show_medication_management_menu":
         reply_message(reply_token, create_medication_management_menu(line_user_id))

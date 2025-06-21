@@ -18,7 +18,9 @@ from models import (
     add_medication_record,
     get_frequency_name,
     add_medication_reminder_full,
-    create_user_if_not_exists # Make sure this is imported if used
+    create_user_if_not_exists,
+    get_all_frequency_options,
+    get_reminder_times_for_user
 )
 import logging # For logging
 
@@ -37,6 +39,24 @@ DOSAGE_OPTIONS = [
     {'label': '2 錠', 'data': '2 錠'}, # Added this based on common dosages
     {'label': '其他', 'data': '其他'}
 ]
+
+def create_frequency_quickreply():
+    try:
+        frequency_options = get_all_frequency_options()  # List of tuples (code, name)
+        buttons = [
+            QuickReplyButton(
+                action=PostbackAction(
+                    label=name,
+                    data=f"action=set_frequency_val&val={code}"
+                )
+            ) for code, name in frequency_options
+        ]
+        return QuickReply(items=buttons)
+    except Exception as e:
+        print(f"取得頻率選單失敗: {e}")
+        return QuickReply(items=[
+            QuickReplyButton(action=PostbackAction(label="一日一次", data="action=set_frequency_val&val=QD"))
+        ])
 
 # ------------------------------------------------------------
 # 執行用藥提醒
@@ -307,49 +327,80 @@ def get_patient_id_by_member_name(line_id: str, member_name: str):
 
 
 def _display_medication_reminders(reply_token, line_bot_api, line_user_id, member):
+    from models import get_reminder_times_for_user, delete_medication_reminder_time  # 確保匯入
+
     conn = get_conn()
     if not conn:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="抱歉，資料庫連線失敗。"))
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 資料庫連線失敗，請稍後再試。"))
         return
+
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT recorder_id, member FROM patients WHERE recorder_id = %s AND member = %s", (line_user_id, member))
+        cursor.execute(
+            "SELECT recorder_id, member FROM patients WHERE recorder_id = %s AND member = %s",
+            (line_user_id, member)
+        )
         patient = cursor.fetchone()
         if not patient:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
             return
 
-        reminders = get_medication_reminders_for_user(line_user_id, member)
+        # ✅ 改為從 reminder_time 抓資料
+        reminders = get_reminder_times_for_user(line_user_id, member)
         if not reminders:
-            message = TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。")
-        else:
-            reminder_messages = []
-            for r in reminders:
-                medicine_name = r.get('medicine_name', '未知藥品')
-                frequency_name = r.get('frequency_name', '未知頻率')
-                dose_quantity = r.get('dose_quantity', '未設定')
-                dosage_unit = r.get('dosage_unit', '')
-                reminder_time = r.get('reminder_time', '未設定時間')
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。"))
+            return
 
-                reminder_messages.append(f"藥品：{medicine_name}\n頻率：{frequency_name}\n劑量：{dose_quantity}{dosage_unit}\n時間：{reminder_time}")
-            message = TextSendMessage(
-                text=f"「{member}」的用藥提醒：\n" + "\n---\n".join(reminder_messages),
-                quick_reply=QuickReply(items=[
-                    QuickReplyButton(
-                        action=PostbackAction(label="刪除提醒", data=f"action=delete_reminder_for_member&member={quote(member)}")
+        reminder_messages = []
+        quick_reply_buttons = []
+
+        for r in reminders:
+            frequency_name = r.get('frequency_name', '未知頻率')
+
+            # 將時間欄位轉為字串
+            times = []
+            for i in range(1, 5):
+                raw_time = r.get(f'time_slot_{i}')
+                if raw_time:
+                    if isinstance(raw_time, str):
+                        times.append(raw_time)
+                    elif hasattr(raw_time, 'strftime'):
+                        times.append(raw_time.strftime('%H:%M'))
+                    else:
+                        times.append(str(raw_time))
+            time_str = '、'.join(times) if times else '未設定'
+
+            reminder_messages.append(f"頻率：{frequency_name}\n時間：{time_str}")
+
+            # 🔘 為每個頻率新增一個刪除按鈕
+            quick_reply_buttons.append(
+                QuickReplyButton(
+                    action=PostbackAction(
+                        label=f"刪除 {frequency_name}",
+                        data=f"action=delete_single_reminder&member={quote(member)}&frequency_name={quote(frequency_name)}"
                     )
-                ])
+                )
             )
+
+        # 組裝最終訊息
+        message = TextSendMessage(
+            text=f"「{member}」的用藥提醒：\n" + "\n---\n".join(reminder_messages),
+            quick_reply=QuickReply(items=quick_reply_buttons)
+        )
+
         line_bot_api.reply_message(reply_token, message)
         clear_temp_state(line_user_id)
+
     except Exception as e:
         logging.error(f"Error displaying reminders for member {member}: {e}")
         import traceback
         traceback.print_exc()
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="查詢提醒失敗，請稍後再試。"))
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 查詢提醒失敗，請稍後再試。"))
+
     finally:
         if conn and conn.is_connected():
             conn.close()
+
 
 
 # ------------------------------------------------------------
@@ -481,7 +532,6 @@ def handle_medication_record_time_selected(reply_token, line_bot_api, user_id, t
             dose_quantity=dose_quantity,
             dosage_unit=dosage_unit, # 傳遞解析出的 dosage_unit
             days=days,
-            record_datetime=record_datetime
         )
 
         # 詢問是否繼續新增其他藥品
@@ -543,20 +593,35 @@ def handle_postback(event, line_bot_api, user_states):
                 ))
         else:
             line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+    elif action == "delete_single_reminder":
+        member = params.get("member")
+        frequency_name = params.get("frequency_name")
+
+        if not member or not frequency_name:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 缺少刪除參數，請重試。"))
+            return
+
+        try:
+            from models import delete_medication_reminder_time
+            success = delete_medication_reminder_time(line_user_id, member, frequency_name)
+
+            if success:
+                # ✅ 刪除成功後 ➜ 直接重新顯示提醒畫面
+                _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 找不到可刪除的提醒資料。"))
+        except Exception as e:
+            logging.error(f"刪除提醒失敗：{e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 刪除提醒時發生錯誤，請稍後再試。"))
+
+
     elif action == "select_patient_for_reminder_initial": # This action is from the "用藥管理" menu to initiate patient selection
         line_bot_api.reply_message(reply_token, create_patient_selection_message(line_user_id, context="manage_reminders")) # Modified call
     elif action == "set_frequency":
         set_temp_state(line_user_id, {"state": "AWAITING_FREQUENCY_SELECTION", **current_state_info})
         line_bot_api.reply_message(reply_token, TextSendMessage(
             text="請選擇用藥頻率：",
-            quick_reply=QuickReply(items=[
-                QuickReplyButton(action=PostbackAction(label="每日一次", data="action=set_frequency_val&val=1_day")),
-                QuickReplyButton(action=PostbackAction(label="每日二次", data="action=set_frequency_val&val=2_day")),
-                QuickReplyButton(action=PostbackAction(label="每日三次", data="action=set_frequency_val&val=3_day")),
-                QuickReplyButton(action=PostbackAction(label="每日四次", data="action=set_frequency_val&val=4_day")),
-                QuickReplyButton(action=PostbackAction(label="固定時間", data="action=set_frequency_val&val=fixed_times")),
-                QuickReplyButton(action=PostbackAction(label="需要時", data="action=set_frequency_val&val=as_needed"))
-            ])
+            quick_reply=create_frequency_quickreply()
         ))
     elif action == "set_frequency_val":
         frequency_val = params.get("val")
@@ -700,7 +765,7 @@ def handle_postback(event, line_bot_api, user_states):
                 # You'll need to get the patient_id from the member name and line_user_id
                 patient_id = get_patient_id_by_member_name(line_user_id, member)
                 if patient_id:
-                    add_medication_record(line_user_id, patient_id, medicine_id, dosage, record_date, record_time)
+                    add_medication_record(line_user_id, patient_id, medicine_id, dosage, record_date)
                     line_bot_api.reply_message(reply_token, TextSendMessage(text="用藥記錄已成功新增！"))
                 else:
                     line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到該用藥對象的資料。"))

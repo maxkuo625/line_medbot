@@ -1,11 +1,10 @@
-# models.py (完整內容)
-
 from database import get_conn
 import random
 import string
 from datetime import datetime, timedelta
 import logging
 import json
+import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -253,120 +252,209 @@ def get_suggested_times_by_frequency(frequency_code):
 
 def get_frequency_name(frequency_code):
     """
-    根據 frequency_code 獲取 frequency_name。
+    根據 frequency_code 從資料庫取得對應的 frequency_name。
+    如果查無資料則回傳 None。
     """
     conn = get_conn()
-    cursor = conn.cursor()
-    name = None
+    if not conn:
+        print("ERROR: 無法連接資料庫")
+        return None
+
     try:
-        cursor.execute("SELECT frequency_name FROM frequency_code WHERE frequency_code = %s", (frequency_code,))
-        result = cursor.fetchone()
-        if result:
-            name = result[0]
-    except Exception as e:
-        print(f"ERROR: Failed to get frequency name for code {frequency_code}: {e}")
-    finally:
-        cursor.close()
-        conn.close()
-    return name if name else frequency_code
-
-def add_medication_reminder_full(user_id, member, drug_name, dosage, frequency_type, frequency_code, times):
-    """
-    將完整的用藥提醒資訊儲存到相關表 (drug_info, medication_record, reminder_time)。
-    這個函數假設 dosage 已經是格式化的字符串（例如 "1 錠"）。
-    """
-    conn = get_conn()
-    cursor = conn.cursor()
-    try:
-        # 1. 確保 drug_info 中有該藥品，並獲取 drug_id
-        # 先嘗試獲取現有的 drug_id
-        drug_id = get_medicine_id_by_name(drug_name)
-        if not drug_id:
-            # 如果藥品不存在，則插入一個新的 drug_info 記錄
-            # drug_id 是 VARCHAR(15)，需要手動生成一個唯一的
-            new_drug_id = f"DRUG_{datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000, 9999)}"
-            cursor.execute(
-                "INSERT INTO drug_info (drug_id, drug_name_zh) VALUES (%s, %s)",
-                (new_drug_id, drug_name)
-            )
-            conn.commit()
-            drug_id = new_drug_id # 使用新生成的 ID
-            print(f"DEBUG: New drug '{drug_name}' added to drug_info with ID {drug_id}.")
-        
-        # 解析 dosage 為 quantity 和 unit
-        try:
-            parts = dosage.split(' ')
-            dosage_quantity = float(parts[0])
-            dosage_unit = parts[1] if len(parts) > 1 else ''
-        except ValueError:
-            dosage_quantity = dosage # 如果無法解析為數字
-            dosage_unit = ''
-
-
-        # 2. 插入或更新 medication_record
-        # medication_record 記錄的是「處方詳情」或「計劃用藥」
-        # 這裡的邏輯需要確保 recorder_id, member, drug_id, frequency_name 組合的唯一性
-        success_med_record = add_medication_record(
-            # mm_id 這裡暫時為 None，讓 add_medication_record 內部處理或創建
-            mm_id=None, # 或從 temp_state 獲取
-            recorder_id=user_id,
-            member=member,
-            drug_id=drug_id,
-            frequency_name=frequency_type,
-            source_detail='提醒設定',
-            dose_quantity=dosage_quantity,
-            dosage_unit=dosage_unit,
-            days=0 # 或其他預設值
-        )
-        if not success_med_record:
-            raise Exception("Failed to add or update medication_record.")
-
-
-        # 3. 插入或更新 reminder_time
-        # reminder_time 的 PRIMARY KEY 是 (recorder_id, member, frequency_name)
-        # 所以對同一個 recorder_id, member, frequency_name 的組合，會執行 UPDATE
-        
-        # 填充 time_slot 欄位
-        times_to_insert = [None] * 4
-        for i, time_str in enumerate(times):
-            if i < 4:
-                times_to_insert[i] = time_str
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT frequency_name FROM frequency_code WHERE frequency_code = %s", (frequency_code,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]
             else:
-                print(f"WARN: More than 4 time slots provided for reminder_time. Only first 5 will be saved.")
-                break # 超出範圍則跳出
+                print(f"WARNING: 查無對應的 frequency_code: {frequency_code}")
+                return None
+    except Exception as e:
+        print(f"ERROR: 查詢 frequency_name 發生錯誤（code={frequency_code}）: {e}")
+        return None
+    finally:
+        conn.close()
 
-        # 計算 total_doses_per_day
-        total_doses_per_day = len(times)
+def get_frequency_code(frequency_name):
+    """
+    根據 frequency_name 從資料庫取得對應的 frequency_code。
+    如果查無資料則回傳 None。
+    """
+    conn = get_conn()
+    if not conn:
+        print("ERROR: 無法連接資料庫")
+        return None
 
-        sql_reminder_time = """
-        INSERT INTO reminder_time (
-            recorder_id, member, frequency_name,
-            time_slot_1, time_slot_2, time_slot_3, time_slot_4, time_slot_5,
-            total_doses_per_day
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            time_slot_1 = VALUES(time_slot_1),
-            time_slot_2 = VALUES(time_slot_2),
-            time_slot_3 = VALUES(time_slot_3),
-            time_slot_4 = VALUES(time_slot_4),
-            time_slot_5 = VALUES(time_slot_5),
-            total_doses_per_day = VALUES(total_doses_per_day),
-            updated_at = CURRENT_TIMESTAMP;
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT frequency_code FROM frequency_code WHERE frequency_name = %s", (frequency_name,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                print(f"WARNING: 查無對應的 frequency_name: {frequency_name}")
+                return None
+    except Exception as e:
+        print(f"ERROR: 查詢 frequency_code 發生錯誤（name={frequency_name}）: {e}")
+        return None
+    finally:
+        conn.close()
+
+def get_all_frequency_options():
+    """
+    從 frequency_code 表中取得所有 frequency_code + frequency_name 對應
+    :return: List of (code, name)
+    """
+    conn = get_conn()
+    if not conn:
+        return []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT frequency_code, frequency_name FROM frequency_code")
+        results = cursor.fetchall()
+        return [(row[0], row[1]) for row in results]
+    except Exception as e:
+        print(f"❗ get_all_frequency_options error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+
+def add_medication_reminder_full(recorder_id, member, medicine_name, frequency_code, dosage, days, times):
+    logging.info(f"DEBUG: add_medication_reminder_full called with recorder_id={recorder_id}, member={member}, medicine_name={medicine_name}, frequency_code={frequency_code}, dosage={dosage}, days={days}, times={times}")
+    conn = get_conn()
+    if not conn:
+        logging.error("Failed to connect to database in add_medication_reminder_full.")
+        raise Exception("Database connection failed.")
+    cursor = conn.cursor()
+    try:
+        # 在函式開頭取得 frequency_name，因為它會在多處使用
+        frequency_name = get_frequency_name(frequency_code)
+
+        # Step 1: Get or create mm_id in medication_main
+        # 修正：medication_main 表中沒有 drug_name_zh 欄位。
+        # 僅根據 recorder_id 和 member 查詢現有的 medication_main 記錄。
+        cursor.execute("SELECT mm_id FROM medication_main WHERE recorder_id = %s AND member = %s", (recorder_id, member))
+        existing_mm = cursor.fetchone()
+        current_mm_id = None
+
+        # Extract dose_quantity and dosage_unit from dosage string
+        parsed_dose_quantity = ""
+        dosage_unit = ""
+        if dosage:
+            match = re.match(r"(\d+\.?\d*)\s*([a-zA-Z%毫升錠顆包個]*).*", dosage)
+            if match:
+                parsed_dose_quantity = match.group(1).strip()
+                dosage_unit = match.group(2).strip() or ""
+            else:
+                logging.warning(f"Could not parse dosage '{dosage}'. Setting dose_quantity to default numeric value '1'.")
+                parsed_dose_quantity = "1" # Default to '1' if parsing fails, to avoid non-numeric strings
+        else:
+            logging.warning("Dosage is empty. Setting dose_quantity to default numeric value '1'.")
+            parsed_dose_quantity = "1" # Default to '1' if dosage is empty
+
+        dose_quantity = parsed_dose_quantity # Assign the parsed/defaulted quantity
+
+        if existing_mm:
+            current_mm_id = existing_mm[0]
+            logging.info(f"DEBUG: Found existing medication_main record with mm_id: {current_mm_id}")
+        else:
+            # 如果沒有現有記錄，則在 medication_main 中創建一個新記錄
+            # 修正：medication_main 表只包含 recorder_id, member, clinic_name, visit_date, doctor_name。
+            # 在此情境下，clinic_name 和 doctor_name 可設為 NULL，visit_date 設為當前日期。
+            cursor.execute(
+                """
+                INSERT INTO medication_main (recorder_id, member, clinic_name, visit_date, doctor_name)
+                VALUES (%s, %s, NULL, CURDATE(), NULL)
+                """,
+                (recorder_id, member)
+            )
+            current_mm_id = cursor.lastrowid
+            logging.info(f"DEBUG: Created a new medication_main record with mm_id: {current_mm_id}")
+
+            # 同時創建一個預設的 medication_record 記錄
+            # 修正：medication_record 表包含 drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days
+            source_detail = "LineBot" # 預設來源細節
+            cursor.execute(
+                """
+                INSERT INTO medication_record (mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (current_mm_id, recorder_id, member, medicine_name, frequency_name, source_detail, dose_quantity, dosage_unit, days)
+            )
+            logging.info(f"DEBUG: Created a default medication_record for new main record with mm_id: {current_mm_id}")
+
+
+        if not current_mm_id:
+            raise Exception("Failed to get or create mm_id for medication_record.")
+
+        # Step 2: Update or insert into reminder_time
+        # 此部分邏輯保持不變，因為它與 reminder_time 表的結構和操作相符。
+        total_doses_per_day = 0
+        if frequency_code == "1_day": total_doses_per_day = 1
+        elif frequency_code == "2_day": total_doses_per_day = 2
+        elif frequency_code == "3_day": total_doses_per_day = 3
+
+        all_time_slots = [None] * 4
+        for i, t in enumerate(times):
+            if i < 4:
+                all_time_slots[i] = t
+
+        check_sql = """
+            SELECT COUNT(*) FROM reminder_time
+            WHERE recorder_id = %s AND member = %s AND frequency_name = %s
         """
-        cursor.execute(sql_reminder_time, (
-            user_id, member, frequency_type, # 這裡的 frequency_name 是易讀的，與 reminder_time PK 一致
-            times_to_insert[0], times_to_insert[1], times_to_insert[2],
-            times_to_insert[3], times_to_insert[4],
-            total_doses_per_day
-        ))
+        cursor.execute(check_sql, (recorder_id, member, frequency_name))
+        exists = cursor.fetchone()[0] > 0
+
+        if exists:
+            update_sql = f"""
+                UPDATE reminder_time
+                SET time_slot_1 = %s, time_slot_2 = %s, time_slot_3 = %s, time_slot_4 = %s,
+                    total_doses_per_day = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+            """
+            cursor.execute(update_sql, (*all_time_slots, total_doses_per_day, recorder_id, member, frequency_name))
+            logging.info(f"DEBUG: Updated reminder_time for {member} ({medicine_name}, {frequency_name}) with times: {', '.join(times)}")
+        else:
+            insert_sql = f"""
+                INSERT INTO reminder_time (recorder_id, member, frequency_name, time_slot_1, time_slot_2, time_slot_3, time_slot_4, total_doses_per_day)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_sql, (recorder_id, member, frequency_name, *all_time_slots, total_doses_per_day))
+            logging.info(f"DEBUG: Inserted new reminder_time for {member} ({medicine_name}, {frequency_name}) with times: {', '.join(times)}")
+
         conn.commit()
-        
-        print(f"DEBUG: Reminder time added/updated for {user_id}-{member}-{frequency_type} at {times}.")
-        return True
+        logging.info(f"Medication reminder for {medicine_name} for {member} added successfully.")
+
     except Exception as e:
         conn.rollback()
-        print(f"ERROR: Failed to add medication reminder full: {e}")
-        return False
+        logging.error(f"ERROR: Failed to add medication reminder full: {e}")
+        raise
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+def get_reminder_times_for_user(recorder_id, member):
+    """
+    從 reminder_time 表中取得用藥提醒時間資訊。
+    """
+    conn = get_conn()
+    if not conn:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT frequency_name, time_slot_1, time_slot_2, time_slot_3, time_slot_4
+            FROM reminder_time
+            WHERE recorder_id = %s AND member = %s
+        """, (recorder_id, member))
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Error fetching reminder times: {e}")
+        return []
     finally:
         cursor.close()
         conn.close()
@@ -376,74 +464,76 @@ def add_medication_reminder_full(user_id, member, drug_name, dosage, frequency_t
 # ------------------------------------------------------------
 def delete_medication_reminder_time(recorder_id, member, frequency_name, time_slot_to_delete=None):
     """
-    從資料庫中刪除指定用戶、成員、頻率下的一個特定用藥時間點，或整個頻率的提醒。
-    注意：目前的 reminder_time 設計，刪除單一時間點較複雜，建議刪除整個頻率。
+    刪除 reminder_time 的指定時間欄位或整筆資料。
     """
     conn = get_conn()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
     try:
         if time_slot_to_delete:
-            # 獲取當前 reminder_time 記錄
+            # 抓出 reminder_time 記錄
             cursor.execute("""
-                SELECT time_slot_1, time_slot_2, time_slot_3, time_slot_4, time_slot_5
+                SELECT time_slot_1, time_slot_2, time_slot_3, time_slot_4
                 FROM reminder_time
                 WHERE recorder_id = %s AND member = %s AND frequency_name = %s
             """, (recorder_id, member, frequency_name))
             current_slots = cursor.fetchone()
 
-            if current_slots:
-                # 將結果轉換為列表，並移除要刪除的時間點
-                updated_slots = []
-                for i in range(1, 6):
-                    slot_val = current_slots[f'time_slot_{i}']
-                    if slot_val and slot_val.strftime('%H:%M') != time_slot_to_delete:
-                        updated_slots.append(slot_val.strftime('%H:%M'))
-                
-                # 如果沒有時間點了，就刪除整條記錄
-                if not updated_slots:
-                    cursor.execute("""
-                        DELETE FROM reminder_time
-                        WHERE recorder_id = %s AND member = %s AND frequency_name = %s
-                    """, (recorder_id, member, frequency_name))
-                else:
-                    # 重新更新時間欄位
-                    sql_update_slots = """
-                        UPDATE reminder_time
-                        SET time_slot_1 = %s, time_slot_2 = %s, time_slot_3 = %s, time_slot_4 = %s, time_slot_5 = %s,
-                            total_doses_per_day = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE recorder_id = %s AND member = %s AND frequency_name = %s
-                    """
-                    new_slots_data = [None] * 5
-                    for i, ts in enumerate(updated_slots):
-                        if i < 5: new_slots_data[i] = ts
-                    
-                    cursor.execute(sql_update_slots, (
-                        new_slots_data[0], new_slots_data[1], new_slots_data[2], new_slots_data[3], new_slots_data[4],
-                        len(updated_slots), recorder_id, member, frequency_name
-                    ))
-                conn.commit()
-                print(f"DEBUG: Deleted time {time_slot_to_delete} for {recorder_id}-{member}-{frequency_name}. Remaining: {updated_slots}")
-                return True
-            else:
-                print(f"WARN: No reminder found for {recorder_id}-{member}-{frequency_name} to delete time {time_slot_to_delete}.")
+            if not current_slots:
+                print(f"⚠️ 找不到提醒記錄：{recorder_id} - {member} - {frequency_name}")
                 return False
 
+            # 比對格式：轉為 H:M 做比對
+            updated_slots = []
+            for i in range(1, 5):
+                slot = current_slots.get(f'time_slot_{i}')
+                if slot and slot.strftime('%H:%M') != time_slot_to_delete:
+                    updated_slots.append(slot)
+
+            if not updated_slots:
+                # 若已刪除所有時間 ➜ 整筆 reminder_time 也刪掉
+                cursor.execute("""
+                    DELETE FROM reminder_time
+                    WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+                """, (recorder_id, member, frequency_name))
+                conn.commit()
+                print(f"🗑️ 已刪除整筆 reminder_time：{recorder_id}-{member}-{frequency_name}")
+                return True
+            else:
+                # 更新剩餘欄位
+                sql_update = """
+                    UPDATE reminder_time
+                    SET time_slot_1 = %s, time_slot_2 = %s, time_slot_3 = %s, time_slot_4 = %s,
+                        total_doses_per_day = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+                """
+                slot_values = [None] * 4
+                for i, slot in enumerate(updated_slots):
+                    slot_values[i] = slot
+                cursor.execute(sql_update, (
+                    *slot_values,
+                    len(updated_slots),
+                    recorder_id, member, frequency_name
+                ))
+                conn.commit()
+                print(f"✅ 刪除時間 {time_slot_to_delete} 成功。剩餘：{[t.strftime('%H:%M') for t in updated_slots]}")
+                return True
         else:
-            # 如果沒有指定 time_slot_to_delete，則刪除整個頻率的提醒設定
+            # 沒有指定單一時間，刪整筆資料
             cursor.execute("""
                 DELETE FROM reminder_time
                 WHERE recorder_id = %s AND member = %s AND frequency_name = %s
             """, (recorder_id, member, frequency_name))
             conn.commit()
-            print(f"DEBUG: Deleted entire reminder for {recorder_id}-{member}-{frequency_name}.")
+            print(f"🗑️ 刪除整筆提醒成功：{recorder_id} - {member} - {frequency_name}")
             return cursor.rowcount > 0
     except Exception as e:
-        print(f"ERROR: Failed to delete medication reminder time: {e}")
+        print(f"❌ 刪除 reminder_time 時發生錯誤：{e}")
         conn.rollback()
         return False
     finally:
         cursor.close()
         conn.close()
+
 
 # ------------------------------------------------------------
 # 查詢用藥提醒
@@ -504,9 +594,9 @@ def get_medicine_list():
     conn = get_conn()
     cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT name_zh FROM drug_info ORDER BY name_zh")
+        cursor.execute("SELECT drug_name_zh FROM drug_info ORDER BY drug_name_zh")
         medicines = cursor.fetchall()
-        return [m['name_zh'] for m in medicines]
+        return [m['drug_name_zh'] for m in medicines]
     except Exception as e:
         print(f"ERROR: Failed to get medicine list: {e}")
         return []
@@ -521,7 +611,7 @@ def get_medicine_id_by_name(medicine_name):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT drug_id FROM drug_info WHERE name_zh = %s", (medicine_name,))
+        cursor.execute("SELECT drug_id FROM drug_info WHERE drug_name_zh = %s", (medicine_name,))
         result = cursor.fetchone()
         return result['drug_id'] if result else None
     except Exception as e:
@@ -602,7 +692,7 @@ def clear_temp_state(recorder_id):
 # 📝 用藥記錄
 # ========================\
 
-def add_medication_record(recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days, record_datetime):
+def add_medication_record(recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days):
     """
     新增一筆用藥記錄到 medication_record 表。
     現在使用 drug_name_zh 而非 drug_id。
@@ -614,15 +704,6 @@ def add_medication_record(recorder_id, member, drug_name_zh, frequency_name, sou
 
     try:
         cursor = conn.cursor()
-
-        # 1. 確保 recorder_id 存在於 users 表中
-        # (這裡假設 create_user_if_not_exists 已在前面呼叫確保使用者存在)
-
-        # 2. 獲取或創建 medication_main 的 mm_id
-        # 這裡的邏輯需要確保mm_id的生成和使用是合理的
-        # 由於 medication_record 表有一個 mm_id FOREIGN KEY，它需要一個有效的 mm_id
-        # 如果每個 medication_record 都需要關聯到一個 medication_main，則需要確保這部分邏輯正確
-        # 根據 models.py 的 snippet，它有嘗試獲取或創建 mm_id 的邏輯
         current_mm_id = None
         cursor.execute(
             "SELECT mm_id FROM medication_main WHERE recorder_id = %s AND member = %s ORDER BY visit_date DESC LIMIT 1",
@@ -636,10 +717,12 @@ def add_medication_record(recorder_id, member, drug_name_zh, frequency_name, sou
             # 假設有一個預設的 clinic_id 和 doctor_name
             clinic_id = 1 # 假設預設診所ID為1
             cursor.execute(
-                "INSERT INTO medication_main (recorder_id, member, clinic_id, visit_date, doctor_name) VALUES (%s, %s, %s, %s, %s)",
-                (recorder_id, member, clinic_id, datetime.now().date(), '未知醫生')
-            )
-            conn.commit()
+            """
+            INSERT INTO medication_record (mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (current_mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days)
+        )
             current_mm_id = cursor.lastrowid
             logging.info(f"DEBUG: Created a default medication_main record with mm_id: {current_mm_id}")
 
@@ -652,10 +735,10 @@ def add_medication_record(recorder_id, member, drug_name_zh, frequency_name, sou
         # 如果需要更新，則需要在這裡添加 SELECT 和 UPDATE 邏輯。
         cursor.execute(
             """
-            INSERT INTO medication_record (mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days, record_datetime)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO medication_record (mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (current_mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days, record_datetime)
+            (current_mm_id, recorder_id, member, drug_name_zh, frequency_name, source_detail, dose_quantity, dosage_unit, days)
         )
         conn.commit()
         logging.info(f"DEBUG: Added medication record for {member} with {drug_name_zh}")
