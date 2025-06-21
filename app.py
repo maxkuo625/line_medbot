@@ -12,18 +12,16 @@ from linebot.models import (
 from urllib.parse import quote, parse_qs # Import parse_qs
 from handlers.message_handler import handle_text_message
 from medication_reminder import (
-    handle_postback, create_patient_selection_message, get_patient_id_by_member_name, 
-    create_medication_management_menu, create_patient_edit_message, create_frequency_quickreply)
+    handle_postback, create_patient_selection_message, create_medication_management_menu, 
+    create_patient_edit_message, create_frequency_quickreply)
 from scheduler import start_scheduler
 from models import (
-    generate_invite_code, bind_family,
-    create_user_if_not_exists, get_family_members,
-    set_temp_state, clear_temp_state, get_temp_state,
-    get_medicine_id_by_name, add_medication_reminder_full
+    set_temp_state, clear_temp_state, get_temp_state, add_medication_reminder_full,
+    get_times_per_day_by_code, get_frequency_name_by_code
 )
-from database import get_conn # Assuming get_conn is in database.py
+from database import get_conn
 import json
-import traceback # For better error logging
+import traceback
 
 # 導入 OCR 解析模組
 from medication_ocr_parser import call_ocr_service, parse_medication_order, convert_frequency_to_times
@@ -321,76 +319,74 @@ def handle_postback_event(event):
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
 
+    # ✅ set_time 處理時間新增（根據 frequency_code 限制）
     if action == "set_time" and state == "AWAITING_TIME_SELECTION":
-        selected_time = event.postback.params.get('time')  # 格式 "HH:MM"
+        selected_time = event.postback.params.get('time')
         times = current_state_info.get("times", [])
+        frequency_code = current_state_info.get("frequency_code")
+        max_times = get_times_per_day_by_code(frequency_code) or 4
+        if max_times == 0:
+            max_times = 1
 
         if selected_time in times:
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=f"⏰ {selected_time} 已經選過了，請選其他時間。")
-            )
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"⏰ {selected_time} 已經選過了，請選其他時間。"))
             return
 
-        if len(times) >= 4:
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text="⚠️ 已達時間設定上限（4個）。請按完成繼續。")
-            )
+        if len(times) >= max_times:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"⚠️ 此頻率（{frequency_code}）最多只能設定 {max_times} 個提醒時間。請按完成繼續。"
+            ))
             return
 
         times.append(selected_time)
         current_state_info["times"] = times
         set_temp_state(line_user_id, current_state_info)
 
-        # 重新顯示時間選擇畫面（用 QuickReply）
         selected_times = current_state_info.get("times", [])
         current_display = "、".join(selected_times) if selected_times else "無"
 
         quick_items = []
-
-        if len(selected_times) < 4:
-            quick_items.append(
-                QuickReplyButton(
-                    action=DatetimePickerAction(
-                        label="➕ 選擇時間",
-                        data="action=set_time",
-                        mode="time"
-                    )
+        if len(selected_times) < max_times:
+            quick_items.append(QuickReplyButton(
+                action=DatetimePickerAction(
+                    label="➕ 選擇時間",
+                    data="action=set_time",
+                    mode="time"
                 )
-            )
+            ))
 
-        # ✅ 為每個已選時間加入刪除按鈕
         for t in selected_times:
-            quick_items.append(
-                QuickReplyButton(
-                    action=PostbackAction(
-                        label=f"🗑 刪除 {t}",
-                        data=f"action=delete_selected_time&time={t}"
-                    )
-                )
-            )
-
-        quick_items.append(
-            QuickReplyButton(
+            quick_items.append(QuickReplyButton(
                 action=PostbackAction(
-                    label="✅ 完成",
-                    data="action=finish_time_selection"
+                    label=f"🗑 刪除 {t}",
+                    data=f"action=delete_selected_time&time={t}"
                 )
+            ))
+
+        quick_items.append(QuickReplyButton(
+            action=PostbackAction(
+                label="✅ 完成",
+                data="action=finish_time_selection"
             )
-        )
+        ))
 
         line_bot_api.reply_message(
             reply_token,
             TextSendMessage(
-                text=f"✅ 已新增時間：{selected_time}\n目前已選擇：{current_display}",
+                text=f"✅ 已新增時間：{selected_time}\n目前已選擇：{current_display}\n（此頻率最多可設定 {max_times} 次提醒）",
                 quick_reply=QuickReply(items=quick_items)
             )
         )
+
     
+    # ✅ delete_selected_time 處理刪除後重建畫面（依頻率限制）
     elif action == "delete_selected_time" and state == "AWAITING_TIME_SELECTION":
         time_to_delete = params.get("time")
         times = current_state_info.get("times", [])
+        frequency_code = current_state_info.get("frequency_code")
+        max_times = get_times_per_day_by_code(frequency_code) or 4
+        if max_times == 0:
+            max_times = 1
 
         if time_to_delete in times:
             times.remove(time_to_delete)
@@ -400,53 +396,43 @@ def handle_postback_event(event):
         else:
             msg = f"⚠️ 找不到時間：{time_to_delete}"
 
-        # 回到時間選擇畫面
         selected_times = current_state_info.get("times", [])
         current_display = "、".join(selected_times) if selected_times else "無"
 
         quick_items = []
-
-        if len(selected_times) < 4:
-            quick_items.append(
-                QuickReplyButton(
-                    action=DatetimePickerAction(
-                        label="➕ 選擇時間",
-                        data="action=set_time",
-                        mode="time"
-                    )
+        if len(selected_times) < max_times:
+            quick_items.append(QuickReplyButton(
+                action=DatetimePickerAction(
+                    label="➕ 選擇時間",
+                    data="action=set_time",
+                    mode="time"
                 )
-            )
+            ))
 
-        # 刪除按鈕 for each time
         for t in selected_times:
-            quick_items.append(
-                QuickReplyButton(
-                    action=PostbackAction(
-                        label=f"🗑 刪除 {t}",
-                        data=f"action=delete_selected_time&time={t}"
-                    )
-                )
-            )
-
-        quick_items.append(
-            QuickReplyButton(
+            quick_items.append(QuickReplyButton(
                 action=PostbackAction(
-                    label="✅ 完成",
-                    data="action=finish_time_selection"
+                    label=f"🗑 刪除 {t}",
+                    data=f"action=delete_selected_time&time={t}"
                 )
+            ))
+
+        quick_items.append(QuickReplyButton(
+            action=PostbackAction(
+                label="✅ 完成",
+                data="action=finish_time_selection"
             )
-        )
+        ))
 
         line_bot_api.reply_message(
             reply_token,
             TextSendMessage(
-                text=f"{msg}\n\n目前已選時間：{current_display}",
+                text=f"{msg}\n\n目前已選擇時間：{current_display}\n（此頻率最多可設定 {max_times} 次提醒）",
                 quick_reply=QuickReply(items=quick_items)
             )
         )
 
-
-    # 新增處理「完成」按鈕的邏輯
+    # ✅ finish_time_selection - 顯示中文頻率名稱於結果中
     elif action == "finish_time_selection" and state == "AWAITING_TIME_SELECTION":
         times = current_state_info.get("times", [])
         if not times:
@@ -461,11 +447,14 @@ def handle_postback_event(event):
                     ))
                     return
 
+                frequency_code = current_state_info["frequency_code"]
+                frequency_name = get_frequency_name_by_code(frequency_code)
+
                 add_medication_reminder_full(
                     recorder_id=line_user_id,
                     member=current_state_info["member"],
                     medicine_name=current_state_info["medicine_name"],
-                    frequency_code=current_state_info["frequency_code"],
+                    frequency_code=frequency_code,
                     dosage=current_state_info["dosage"],
                     days=current_state_info["days"],
                     times=times
@@ -477,16 +466,16 @@ def handle_postback_event(event):
                         f"✅ 提醒已建立成功！\n"
                         f"👤 用藥對象：{current_state_info['member']}\n"
                         f"💊 藥品：{current_state_info['medicine_name']}\n"
-                        f"⏰ 頻率：{current_state_info['frequency_code']}\n"
+                        f"🔁 頻率：{frequency_name}（{frequency_code}）\n"
                         f"📆 天數：{current_state_info['days']}\n"
                         f"🕒 時間：{', '.join(times)}"
                     )
                 ))
             except Exception as e:
                 app.logger.error(f"建立提醒失敗：{e}")
-                import traceback
                 traceback.print_exc()
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 建立提醒時發生錯誤，請稍後再試。"))
+
 
     if action == "show_medication_management_menu":
         reply_message(reply_token, create_medication_management_menu(line_user_id))

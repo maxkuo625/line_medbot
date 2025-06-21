@@ -319,6 +319,51 @@ def get_all_frequency_options():
     finally:
         conn.close()
 
+def get_times_per_day_by_code(frequency_code):
+    """
+    根據 frequency_code 從資料庫查詢 times_per_day。
+    若查不到則預設回傳 4。
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT times_per_day FROM frequency_code WHERE frequency_code = %s",
+            (frequency_code,)
+        )
+        result = cursor.fetchone()
+        if result:
+            return int(result[0])  # 把 float 轉為 int
+        else:
+            return 4  # 預設最大次數
+    except Exception as e:
+        print(f"ERROR: get_times_per_day_by_code({frequency_code}) 發生錯誤: {e}")
+        return 4
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_frequency_name_by_code(frequency_code):
+    """
+    根據 frequency_code 查詢中文名稱，例如 QD → 一日一次
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT frequency_name FROM frequency_code WHERE frequency_code = %s",
+            (frequency_code,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else frequency_code
+    except Exception as e:
+        print(f"ERROR: 查詢頻率名稱失敗 ({frequency_code}): {e}")
+        return frequency_code
+    finally:
+        cursor.close()
+        conn.close()
+
+
 
 
 def add_medication_reminder_full(recorder_id, member, medicine_name, frequency_code, dosage, days, times):
