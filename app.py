@@ -17,7 +17,8 @@ from medication_reminder import (
 from scheduler import start_scheduler
 from models import (
     set_temp_state, clear_temp_state, get_temp_state, add_medication_reminder_full,
-    get_times_per_day_by_code, get_frequency_name_by_code, bind_family,unbind_family
+    get_times_per_day_by_code, get_frequency_name_by_code, bind_family,unbind_family,
+    create_user_if_not_exists
 )
 from database import get_conn
 import json
@@ -147,6 +148,7 @@ def welcome_invited_user(reply_token, line_bot_api):
 
 @handler.add(FollowEvent)
 def handle_follow(event):
+    create_user_if_not_exists(recorder_id)
     recorder_id = event.source.user_id
     body = request.get_data(as_text=True)
     try:

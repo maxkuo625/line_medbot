@@ -32,23 +32,37 @@ def get_user_by_recorder_id(recorder_id):
 
 def create_user_if_not_exists(recorder_id):
     """
-    如果使用者不存在，則在 users 表中創建新的使用者記錄。
+    如果使用者不存在，則從 LINE API 嘗試取得使用者暱稱，並建立 users 資料。
     """
+    from linebot.exceptions import LineBotApiError
+    from config import CHANNEL_ACCESS_TOKEN
+    from linebot import LineBotApi
+
     conn = get_conn()
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT recorder_id FROM users WHERE recorder_id=%s", (recorder_id,))
         if not cursor.fetchone():
-            cursor.execute("INSERT INTO users (recorder_id, user_name) VALUES (%s, %s)", (recorder_id, '新用戶'))
+            user_name = "新用戶"
+            try:
+                line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+                profile = line_bot_api.get_profile(recorder_id)
+                user_name = profile.display_name
+                print(f"✅ 取得使用者暱稱：{user_name}")
+            except LineBotApiError as e:
+                print(f"⚠️ 無法取得使用者暱稱，使用預設名稱：{e}")
+
+            cursor.execute("INSERT INTO users (recorder_id, user_name) VALUES (%s, %s)", (recorder_id, user_name))
             conn.commit()
-            print(f"DEBUG: Created new user with recorder_id: {recorder_id}")
+            print(f"✅ 已建立使用者資料：{recorder_id}（{user_name}）")
         else:
-            print(f"DEBUG: User with recorder_id: {recorder_id} already exists.")
+            print(f"🔁 使用者已存在：{recorder_id}")
     except Exception as e:
-        print(f"ERROR: Failed to create user if not exists for {recorder_id}: {e}")
+        print(f"❌ 建立使用者資料失敗：{e}")
     finally:
         cursor.close()
         conn.close()
+
 
 # ========================\
 # 🧑‍🤝‍🧑 家庭成員管理
@@ -158,8 +172,6 @@ def generate_invite_code(elder_user_id, expire_minutes=60):
 
 
 def bind_family(invite_code, family_user_id):
-    from database import get_conn
-    import datetime
 
     create_user_if_not_exists(family_user_id)
 
