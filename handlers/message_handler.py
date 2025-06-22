@@ -104,35 +104,38 @@ def handle_text_message(event, line_bot_api):
     elif message_text == "查詢家人":
         bindings = get_family_bindings(line_user_id)
         if not bindings:
-            reply = "您目前沒有綁定任何家人。"
-        else:
-            lines = [f"👤 [{b['role']}]：{b['user_id']}" for b in bindings]
-            reply = "📋 您的家人綁定如下：\n" + "\n".join(lines)
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 目前尚未綁定任何家人。"))
+            return
+
+        lines = ["📋 您的家人綁定如下："]
+        for b in bindings:
+            short_id = b["user_id"][-6:]
+            lines.append(f"👤 [{b['role']}]：{b['user_name']}（ID: {short_id}）")
+
+        reply = "\n".join(lines)
         line_bot_api.reply_message(reply_token, TextSendMessage(text=reply))
-        return
 
     elif message_text == "解除綁定":
         bindings = get_family_bindings(line_user_id)
         if not bindings:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="您目前沒有綁定任何家人。"))
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 您目前沒有任何綁定對象。"))
             return
 
-        buttons = []
+        items = []
         for b in bindings:
-            label = f"{b['role']}:{b['user_id'][-6:]}"
-            buttons.append(QuickReplyButton(
+            short_id = b["user_id"][-6:]
+            label = f"{b['user_name']} ({short_id})"
+            items.append(QuickReplyButton(
                 action=PostbackAction(
                     label=label,
                     data=f"action=confirm_unbind&target={b['user_id']}"
                 )
             ))
 
-        set_temp_state(line_user_id, {"state": "AWAITING_UNBIND_SELECTION"})
         line_bot_api.reply_message(reply_token, TextSendMessage(
             text="請點選您想解除綁定的對象：",
-            quick_reply=QuickReply(items=buttons)
+            quick_reply=QuickReply(items=items)
         ))
-        return
 
     elif message_text == "綁定":
         set_temp_state(line_user_id, {"state": "AWAITING_INVITE_CODE"})

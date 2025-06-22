@@ -17,7 +17,7 @@ from medication_reminder import (
 from scheduler import start_scheduler
 from models import (
     set_temp_state, clear_temp_state, get_temp_state, add_medication_reminder_full,
-    get_times_per_day_by_code, get_frequency_name_by_code, bind_family
+    get_times_per_day_by_code, get_frequency_name_by_code, bind_family,unbind_family
 )
 from database import get_conn
 import json
@@ -459,10 +459,23 @@ def handle_postback_event(event):
                 ])
             )
         ])
-    elif action in ["confirm_unbind"]:
-        handle_family_postback(event, line_bot_api)
-    else:
-        handle_postback(event, line_bot_api, {})
+    elif action == "confirm_unbind":
+        target_user_id = params.get("target")
+        if not target_user_id:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 未提供綁定對象 ID。"))
+            return
+
+        # 執行解除綁定
+        if unbind_family(line_user_id, target_user_id):
+            short_id = target_user_id[-6:]
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"✅ 已解除與 {short_id} 的綁定關係。"
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="❌ 解除綁定失敗，請稍後再試。"
+            ))
+
 
     # ✅ set_time 處理時間新增（根據 frequency_code 限制）
     if action == "set_time" and state == "AWAITING_TIME_SELECTION":

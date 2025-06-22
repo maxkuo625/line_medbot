@@ -212,13 +212,17 @@ def get_family_bindings(line_user_id):
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT '邀請他人' AS role, recipient_line_id AS user_id
-            FROM invitation_recipients
-            WHERE recorder_id = %s
+            SELECT '邀請他人' AS role, r.recipient_line_id AS user_id, u.user_name
+            FROM invitation_recipients r
+            JOIN users u ON r.recipient_line_id = u.recorder_id
+            WHERE r.recorder_id = %s
+
             UNION
-            SELECT '被邀請人' AS role, recorder_id AS user_id
-            FROM invitation_recipients
-            WHERE recipient_line_id = %s
+
+            SELECT '被邀請人' AS role, r.recorder_id AS user_id, u.user_name
+            FROM invitation_recipients r
+            JOIN users u ON r.recorder_id = u.recorder_id
+            WHERE r.recipient_line_id = %s
         """, (line_user_id, line_user_id))
         result = cursor.fetchall()
     except Exception as e:
@@ -226,6 +230,7 @@ def get_family_bindings(line_user_id):
     finally:
         conn.close()
     return result
+
 
 def unbind_family(line_user_id, target_user_id):
     conn = get_conn()
