@@ -161,18 +161,21 @@ def bind_family(invite_code, family_user_id):
     from database import get_conn
     import datetime
 
+    create_user_if_not_exists(family_user_id)
+
     with get_conn() as conn:
         cursor = conn.cursor(dictionary=True)
+
         cursor.execute("""
             SELECT * FROM invite_codes 
-            WHERE invite_code=%s
+            WHERE code = %s
         """, (invite_code,))
         code_row = cursor.fetchone()
 
         if not code_row:
             return False, None  # 無此邀請碼
 
-        if code_row['used'] or code_row['expired_at'] < datetime.datetime.now():
+        if code_row['used'] or code_row['expires_at'] < datetime.datetime.now():
             return False, None  # 已使用或過期
 
         inviter_id = code_row['inviter_recorder_id']
@@ -193,12 +196,14 @@ def bind_family(invite_code, family_user_id):
 
         # 標記為已使用
         cursor.execute("""
-            UPDATE invite_codes SET used=TRUE, bound_at=NOW(), recipient_line_id=%s
+            UPDATE invite_codes 
+            SET used=TRUE, bound_at=NOW(), recipient_line_id=%s
             WHERE id=%s
         """, (family_user_id, code_row['id']))
 
         conn.commit()
         return True, inviter_id
+
 
 
 def get_family_bindings(line_user_id):

@@ -159,6 +159,12 @@ def handle_follow(event):
         match = re.search(r"綁定[\s%20]*(\w+)", raw_text)
         if match:
             invite_code = match.group(1).strip().upper()
+
+            # 新增提示文字
+            line_bot_api.push_message(recorder_id, TextSendMessage(
+                text="📌 您即將進行家人綁定：\n系統偵測到您收到的邀請碼，為了保護您的帳戶安全，請確認是否要與對方建立綁定關係。"
+            ))
+
             push_binding_confirmation(recorder_id, invite_code)
             return
 
@@ -205,10 +211,7 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        if app.debug or request.headers.get("X-Debug-Skip-Signature") == "true":
-            app.logger.warning("⚠️ 開發模式：略過簽名驗證（Postman 模擬）")
-        else:
-            abort(400)
+        abort(400)
     except LineBotApiError as e:
         app.logger.error(f"LINE Bot API Error: {e.status_code} {e.error.message}")
         app.logger.error(f"Details: {e.error.details}")
@@ -229,13 +232,20 @@ def handle_message(event):
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
 
-    # 判斷是否為綁定開頭的訊息
     if message_text.startswith("綁定 "):
         match = re.match(r"綁定\s*(\w+)", message_text)
         if match:
             invite_code = match.group(1).strip().upper()
+        
+            # 先顯示引導提示
+            line_bot_api.reply_message(reply_token, [
+                TextSendMessage(text="📌 您即將進行家人綁定：\n系統偵測到您收到的邀請碼，為了保護您的帳戶安全，請確認是否要與對方建立綁定關係。")
+            ])
+        
+            # 接著顯示確認視窗
             push_binding_confirmation(line_user_id, invite_code)
             return
+
 
     if message_text == "提醒用藥主選單":
         flex_message = create_main_medication_menu()

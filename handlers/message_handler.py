@@ -90,21 +90,11 @@ def handle_text_message(event, line_bot_api):
     current_state = get_temp_state(line_user_id) or {}
     state = current_state.get("state")
 
-    # ✅ 處理格式為「綁定 ABC123」的直接輸入
     match = re.match(r"^綁定\s*(\w{6})$", message_text)
     if match:
-        invite_code = match.group(1).strip().upper()
-        try:
-            success, bound_user_id = bind_family(invite_code, line_user_id)
-            if success:
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=f"✅ 綁定成功！您已與帳號 {bound_user_id} 建立綁定。\n您現在可以輸入「新增用藥提醒」開始設定提醒。"
-                ))
-            else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 綁定失敗，邀請碼無效或已過期。"))
-        except Exception as e:
-            print(f"Error binding family from direct input: {e}")
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 綁定過程中發生錯誤，請稍後再試。"))
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請點選由系統產生的綁定連結，系統會引導您確認是否要綁定，避免誤操作。"
+        ))
         return
 
     if message_text == "產生邀請碼":
