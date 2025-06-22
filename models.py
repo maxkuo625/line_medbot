@@ -6,6 +6,7 @@ import logging
 import json
 import re
 from linebot.models import TextSendMessage
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
@@ -157,44 +158,47 @@ def generate_invite_code(elder_user_id, expire_minutes=60):
 
 
 def bind_family(invite_code, family_user_id):
-    from linebot import LineBotApi
-    from config import CHANNEL_ACCESS_TOKEN
-    line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+    from database import get_conn
+    import datetime
 
     with get_conn() as conn:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT * FROM invite_codes 
-            WHERE code=%s AND recipient_line_id IS NULL AND expires_at > NOW()
+            WHERE invite_code=%s
         """, (invite_code,))
-        result = cursor.fetchone()
-        if not result:
-            return False, None
+        code_row = cursor.fetchone()
 
-        inviter = result['inviter_recorder_id']
-        invite_id = result['id']
+        if not code_row:
+            return False, None  # 無此邀請碼
 
+        if code_row['used'] or code_row['expired_at'] < datetime.datetime.now():
+            return False, None  # 已使用或過期
+
+        inviter_id = code_row['inviter_recorder_id']
+
+        # 避免重複綁定
         cursor.execute("""
-            UPDATE invite_codes SET recipient_line_id=%s, bound_at=NOW()
-            WHERE id=%s
-        """, (family_user_id, invite_id))
+            SELECT * FROM invitation_recipients
+            WHERE recorder_id=%s AND recipient_line_id=%s
+        """, (inviter_id, family_user_id))
+        if cursor.fetchone():
+            return True, inviter_id  # 已存在綁定
 
+        # 寫入綁定紀錄
         cursor.execute("""
-            INSERT IGNORE INTO invitation_recipients (recorder_id, recipient_line_id)
+            INSERT INTO invitation_recipients (recorder_id, recipient_line_id)
             VALUES (%s, %s)
-        """, (inviter, family_user_id))
+        """, (inviter_id, family_user_id))
+
+        # 標記為已使用
+        cursor.execute("""
+            UPDATE invite_codes SET used=TRUE, bound_at=NOW(), recipient_line_id=%s
+            WHERE id=%s
+        """, (family_user_id, code_row['id']))
 
         conn.commit()
-
-        # ✅ 綁定成功後通知邀請人
-        try:
-            line_bot_api.push_message(inviter, TextSendMessage(
-                text=f"✅ 您邀請的帳號（{family_user_id[-6:]}）已完成綁定 🎉"
-            ))
-        except Exception as e:
-            print(f"❗ 通知邀請人失敗：{e}")
-
-        return True, inviter
+        return True, inviter_id
 
 
 def get_family_bindings(line_user_id):

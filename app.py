@@ -1,4 +1,4 @@
-from flask import Flask, request, abort
+from flask import Flask, request, abort, current_app
 from linebot import LineBotApi, WebhookHandler
 from config import CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -17,11 +17,12 @@ from medication_reminder import (
 from scheduler import start_scheduler
 from models import (
     set_temp_state, clear_temp_state, get_temp_state, add_medication_reminder_full,
-    get_times_per_day_by_code, get_frequency_name_by_code
+    get_times_per_day_by_code, get_frequency_name_by_code, bind_family
 )
 from database import get_conn
 import json
 import traceback
+import re
 
 # 導入 OCR 解析模組
 from medication_ocr_parser import call_ocr_service, parse_medication_order, convert_frequency_to_times
@@ -146,10 +147,51 @@ def welcome_invited_user(reply_token, line_bot_api):
 
 @handler.add(FollowEvent)
 def handle_follow(event):
-    reply_token = event.reply_token
-    welcome_invited_user(reply_token, line_bot_api)
+    recorder_id = event.source.user_id
+    body = request.get_data(as_text=True)
+    try:
+        event_json = json.loads(body)
+        raw_text = json.dumps(event_json, ensure_ascii=False)
+    except Exception as e:
+        raw_text = body
 
+    if "綁定" in raw_text:
+        match = re.search(r"綁定[\s%20]*(\w+)", raw_text)
+        if match:
+            invite_code = match.group(1).strip().upper()
+            push_binding_confirmation(recorder_id, invite_code)
+            return
 
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text="👋 歡迎加入！請輸入『家人管理』開始設定與綁定功能。"
+    ))
+
+def push_binding_confirmation(recorder_id, invite_code):
+    bubble = BubbleContainer(
+        direction="ltr",
+        body=BoxComponent(
+            layout="vertical",
+            contents=[
+                TextComponent(text="👤 邀請碼確認", weight="bold", size="lg", align="center"),
+                SeparatorComponent(margin="md"),
+                TextComponent(text=f"是否要與邀請碼 {invite_code} 的使用者建立綁定？", wrap=True, margin="md"),
+                ButtonComponent(
+                    style="primary",
+                    color="#00C300",
+                    action=PostbackAction(label="✅ 是，立即綁定", data=f"action=confirm_bind&code={invite_code}")
+                ),
+                ButtonComponent(
+                    style="secondary",
+                    action=PostbackAction(label="❌ 否，不綁定", data=f"action=reject_bind&code={invite_code}")
+                )
+            ],
+            spacing="md",
+            padding_all="20px"
+        )
+    )
+
+    flex_msg = FlexSendMessage(alt_text="是否要與邀請人綁定？", contents=bubble)
+    line_bot_api.push_message(recorder_id, flex_msg)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -163,7 +205,10 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)
+        if app.debug or request.headers.get("X-Debug-Skip-Signature") == "true":
+            app.logger.warning("⚠️ 開發模式：略過簽名驗證（Postman 模擬）")
+        else:
+            abort(400)
     except LineBotApiError as e:
         app.logger.error(f"LINE Bot API Error: {e.status_code} {e.error.message}")
         app.logger.error(f"Details: {e.error.details}")
@@ -183,6 +228,14 @@ def handle_message(event):
     message_text = event.message.text.strip()
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
+
+    # 判斷是否為綁定開頭的訊息
+    if message_text.startswith("綁定 "):
+        match = re.match(r"綁定\s*(\w+)", message_text)
+        if match:
+            invite_code = match.group(1).strip().upper()
+            push_binding_confirmation(line_user_id, invite_code)
+            return
 
     if message_text == "提醒用藥主選單":
         flex_message = create_main_medication_menu()
@@ -374,7 +427,29 @@ def handle_postback_event(event):
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
 
-    if action in ["confirm_unbind"]:
+    if action == "confirm_bind":
+        code = params.get("code")
+        success, inviter = bind_family(code, line_user_id)
+        if success:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"✅ 綁定成功！您已與帳號 {inviter[-6:]} 建立綁定。"
+            ))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="❌ 綁定失敗，邀請碼無效或已使用或過期。"
+            ))
+    elif action == "reject_bind":
+        line_bot_api.reply_message(reply_token, [
+            TextSendMessage(text="👌 已略過綁定流程。您仍可使用 BOT 的功能。"),
+            TextSendMessage(
+                text="請選擇下一步操作：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="家人管理", text="家人管理")),
+                    QuickReplyButton(action=MessageAction(label="提醒用藥主選單", text="提醒用藥主選單"))
+                ])
+            )
+        ])
+    elif action in ["confirm_unbind"]:
         handle_family_postback(event, line_bot_api)
     else:
         handle_postback(event, line_bot_api, {})

@@ -85,9 +85,27 @@ def create_usage_instructions_message():
 def handle_text_message(event, line_bot_api):
     reply_token = event.reply_token
     line_user_id = event.source.user_id
+    create_user_if_not_exists(line_user_id)
     message_text = event.message.text.strip()
     current_state = get_temp_state(line_user_id) or {}
     state = current_state.get("state")
+
+    # ✅ 處理格式為「綁定 ABC123」的直接輸入
+    match = re.match(r"^綁定\s*(\w{6})$", message_text)
+    if match:
+        invite_code = match.group(1).strip().upper()
+        try:
+            success, bound_user_id = bind_family(invite_code, line_user_id)
+            if success:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"✅ 綁定成功！您已與帳號 {bound_user_id} 建立綁定。\n您現在可以輸入「新增用藥提醒」開始設定提醒。"
+                ))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 綁定失敗，邀請碼無效或已過期。"))
+        except Exception as e:
+            print(f"Error binding family from direct input: {e}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 綁定過程中發生錯誤，請稍後再試。"))
+        return
 
     if message_text == "產生邀請碼":
         handle_invite_code_request(reply_token, line_user_id, line_bot_api)
@@ -293,7 +311,8 @@ def handle_invite_code_request(reply_token, line_user_id, line_bot_api):
         return
 
     expires_str = expires_at.strftime('%Y/%m/%d %H:%M')
-    invite_link = f"https://line.me/R/oaMessage/@651omrog/?綁定%20{invite_code}"
+    encoded_text = quote(f"綁定 {invite_code}")
+    invite_link = f"https://line.me/R/oaMessage/@651omrog/?{encoded_text}"
     encoded_link = quote(invite_link, safe='')
 
     bubble = BubbleContainer(
@@ -305,13 +324,20 @@ def handle_invite_code_request(reply_token, line_user_id, line_bot_api):
                 SeparatorComponent(margin="md"),
                 TextComponent(text=f"邀請碼：{invite_code}", size="md", margin="md"),
                 TextComponent(text=f"效期至：{expires_str}", size="sm", color="#888888"),
-                TextComponent(text="點擊分享按鈕來分享：", size="sm", margin="md"),
+                TextComponent(text="分享給親朋好友：", size="sm", margin="md"),
                 TextComponent(text=invite_link, wrap=True, size="sm", color="#0066cc"),
                 ButtonComponent(
                     style="link",
                     height="sm",
                     action=URIAction(label="🔗 與親朋好友分享", uri=f"line://msg/text/?{encoded_link}")
-                )
+                ),
+                TextComponent(
+                text="📌 提醒：請點擊上方連結後，在看到輸入框有預填訊息後送出訊息完成綁定。",
+                wrap=True,
+                size="xs",
+                color="#888888",
+                margin="md"
+            )
             ],
             spacing="md",
             padding_all="20px"
@@ -319,10 +345,7 @@ def handle_invite_code_request(reply_token, line_user_id, line_bot_api):
     )
 
     flex_msg = FlexSendMessage(alt_text="邀請碼產生成功", contents=bubble)
-    line_bot_api.reply_message(reply_token, [
-    flex_msg,
-    TextSendMessage(text="📌 提醒：請點擊上方連結後，在輸入框按下『傳送』鍵完成綁定。")
-])
+    line_bot_api.reply_message(reply_token, flex_msg)
 
 # 這是 create_patient_selection_for_reminders_view 的實現，用於「查看提醒」
 def create_patient_selection_for_reminders_view(line_id):
