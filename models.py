@@ -7,6 +7,8 @@ import json
 import re
 from linebot.models import TextSendMessage
 from urllib.parse import quote
+from config import CHANNEL_ACCESS_TOKEN
+from linebot import LineBotApi
 
 logging.basicConfig(level=logging.INFO)
 
@@ -171,49 +173,64 @@ def generate_invite_code(elder_user_id, expire_minutes=60):
         return code, expires_at
 
 
-def bind_family(invite_code, family_user_id):
-
-    create_user_if_not_exists(family_user_id)
+def bind_family(invite_code, recipient_line_id):
+    """
+    使用邀請碼綁定家庭關係，並通知邀請人。
+    """
+    create_user_if_not_exists(recipient_line_id)
+    line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 
     with get_conn() as conn:
         cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("""
-            SELECT * FROM invite_codes 
-            WHERE code = %s
-        """, (invite_code,))
+        # 查詢邀請碼
+        cursor.execute("SELECT * FROM invite_codes WHERE code = %s", (invite_code,))
         code_row = cursor.fetchone()
 
         if not code_row:
             return False, None  # 無此邀請碼
 
-        if code_row['used'] or code_row['expires_at'] < datetime.datetime.now():
-            return False, None  # 已使用或過期
+        if code_row['used'] or code_row['expires_at'] < datetime.now():
+            return False, None  # 已使用或已過期
 
         inviter_id = code_row['inviter_recorder_id']
 
         # 避免重複綁定
         cursor.execute("""
             SELECT * FROM invitation_recipients
-            WHERE recorder_id=%s AND recipient_line_id=%s
-        """, (inviter_id, family_user_id))
+            WHERE recorder_id = %s AND recipient_line_id = %s
+        """, (inviter_id, recipient_line_id))
         if cursor.fetchone():
-            return True, inviter_id  # 已存在綁定
+            return True, inviter_id  # 已經綁定過
 
-        # 寫入綁定紀錄
+        # 取得被邀請人名稱
+        cursor.execute("SELECT user_name FROM users WHERE recorder_id = %s", (recipient_line_id,))
+        row = cursor.fetchone()
+        recipient_name = row['user_name'] if row else "家人"
+
+        # 寫入綁定紀錄（可依需求補 relation_type、recipient_name）
         cursor.execute("""
-            INSERT INTO invitation_recipients (recorder_id, recipient_line_id)
-            VALUES (%s, %s)
-        """, (inviter_id, family_user_id))
+            INSERT INTO invitation_recipients (recorder_id, recipient_line_id, recipient_name, relation_type)
+            VALUES (%s, %s, %s, %s)
+        """, (inviter_id, recipient_line_id, recipient_name, '家人'))
 
-        # 標記為已使用
+        # 更新邀請碼為已使用
         cursor.execute("""
             UPDATE invite_codes 
-            SET used=TRUE, bound_at=NOW(), recipient_line_id=%s
-            WHERE id=%s
-        """, (family_user_id, code_row['id']))
+            SET used = TRUE, bound_at = NOW(), recipient_line_id = %s
+            WHERE id = %s
+        """, (recipient_line_id, code_row['id']))
 
         conn.commit()
+
+        # ✅ 通知邀請人
+        try:
+            line_bot_api.push_message(inviter_id, TextSendMessage(
+                text=f"📬 您邀請的 {recipient_name} 已成功綁定，將接收您的用藥提醒。"
+            ))
+        except Exception as e:
+            print(f"⚠️ 發送綁定通知失敗: {e}")
+
         return True, inviter_id
 
 

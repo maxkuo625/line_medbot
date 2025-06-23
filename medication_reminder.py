@@ -71,6 +71,7 @@ def run_reminders(line_bot_api):
     try:
         cursor = conn.cursor(dictionary=True)
         current_time_str = datetime.now().strftime('%H:%M:%S')
+        display_time = datetime.now().strftime('%H:%M')
 
         query = """
         SELECT
@@ -78,70 +79,57 @@ def run_reminders(line_bot_api):
             rt.member,
             fc.frequency_name,
             mr.dose_quantity,
-            mr.dosage_unit,
-            COALESCE(di.drug_name_zh, mr.drug_name_zh) AS medicine_name
+            di.drug_name_zh AS medicine_name
         FROM
             reminder_time rt
         JOIN
             medication_record mr ON rt.recorder_id = mr.recorder_id
-                       AND rt.member = mr.member
-                       AND rt.frequency_name = mr.frequency_name
-        LEFT JOIN drug_info di ON mr.drug_name_zh = di.drug_name_zh
+                                AND rt.member = mr.member
+                                AND rt.frequency_name = mr.frequency_count_code
+        LEFT JOIN
+            drug_info di ON mr.drug_name_zh = di.drug_name_zh
         JOIN
-            frequency_code fc ON rt.frequency_name = fc.frequency_name
+            frequency_code fc ON rt.frequency_name = fc.frequency_code
         WHERE
             TIME(%s) IN (
                 TIME(rt.time_slot_1),
                 TIME(rt.time_slot_2),
-                TIME(rt.time_slot_3),
-                TIME(rt.time_slot_4)
-        );
-
+                TIME(rt.time_slot_3)
+            )
         """
+
         cursor.execute(query, (current_time_str,))
-        reminders_to_send = cursor.fetchall()
-        cursor.execute(query, (current_time_str,))
-        reminders_to_send = cursor.fetchall()
+        reminders = cursor.fetchall()
 
-        if reminders_to_send:
-            logging.info(f"找到 {len(reminders_to_send)} 個提醒需要發送。")
-            for reminder in reminders_to_send:
-                line_user_id = reminder['line_user_id']
-                member = reminder['member']
-                medicine_name = reminder['medicine_name']
-                dose_quantity = reminder.get('dose_quantity', '未設定')
-                dosage_unit = reminder.get('dosage_unit', '')
-                frequency_name = reminder.get('frequency_name', '未設定頻率')
-
-                display_time = datetime.now().strftime('%H:%M')
-
-                message_text = (
-                    f"🔔 用藥時間到囉！\n"
-                    f"👤 用藥者：{member}\n"
-                    f"💊 藥品：{medicine_name}\n"
-                    f"⏰ 頻率：{frequency_name}\n"
-                    f"💊 劑量：{dose_quantity}{dosage_unit}\n" # 如果能獲取到劑量再顯示
-                    f"⏰ 時間：{display_time}\n"
-                    f"請記得按時服用喔！"
-                )
-                try:
-                    line_bot_api.push_message(
-                        line_user_id,
-                        TextSendMessage(text=message_text)
-                    )
-                    logging.info(f"已向 {member} ({line_user_id}) 發送提醒：{medicine_name} at {display_time}")
-                except LineBotApiError as e:
-                    logging.error(f"發送提醒給 {line_user_id} 失敗: {e}")
-        else:
+        if not reminders:
             logging.info("目前沒有需要發送的提醒。")
+            return
+
+        for reminder in reminders:
+            line_user_id = reminder["line_user_id"]
+            member = reminder["member"]
+            medicine_name = reminder["medicine_name"] or "（未命名藥品）"
+            frequency_name = reminder["frequency_name"]
+            dose_quantity = reminder["dose_quantity"]
+            # dosage_unit = reminder.get("dosage_unit") or ""
+            dose_str = f"{dose_quantity}" if dose_quantity else "未提供"
+
+            message_text = (
+                f"🔔 用藥時間到囉！\n"
+                f"👤 用藥者：{member}\n"
+                f"💊 藥品：{medicine_name}\n"
+                f"⏰ 頻率：{frequency_name}\n"
+                f"💊 劑量：{dose_str}\n"
+                f"⏰ 時間：{display_time}\n"
+                f"請記得按時服用喔！"
+            )
+
+            line_bot_api.push_message(line_user_id, TextSendMessage(text=message_text))
 
     except Exception as e:
         logging.error(f"執行提醒任務時發生錯誤: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
-        if conn and conn.is_connected():
-            conn.close()
+        conn.close()
 
 
 # ------------------------------------------------------------
