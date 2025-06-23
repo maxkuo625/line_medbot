@@ -263,8 +263,7 @@ def handle_message(event):
                 mr.drug_name_zh, 
                 mr.frequency_count_code AS frequency_code, 
                 fc.frequency_name,
-                mr.dose_quantity, 
-                mr.dosage_unit, 
+                mr.dose_quantity,  
                 mr.days
             FROM medication_record mr
             LEFT JOIN frequency_code fc ON mr.frequency_count_code = fc.frequency_code
@@ -277,10 +276,18 @@ def handle_message(event):
         conn.close()
 
         if latest_ocr:
+            converted_ocr = {
+                "member": latest_ocr["member"],
+                "drug_name_zh": latest_ocr["drug_name_zh"],
+                "frequency_code": latest_ocr["frequency_code"],
+                "frequency_name": latest_ocr["frequency_name"],
+                "dose_quantity": str(latest_ocr["dose_quantity"]),
+                "days": int(latest_ocr["days"])
+}
             # 提示用戶是否要使用這筆 OCR 的資料
             set_temp_state(line_user_id, {
                 "state": "OCR_PENDING_CONFIRM",
-                "ocr_data": latest_ocr  # 暫存查出來的 dict 結果
+                "ocr_data": converted_ocr  # 暫存查出來的 dict 結果
             })
 
             reply_message(reply_token, TextSendMessage(
@@ -289,7 +296,7 @@ def handle_message(event):
                     f"👤 用藥對象：{latest_ocr['member']}\n"
                     f"💊 藥品：{latest_ocr['drug_name_zh']}\n"
                     f"🔁 頻率：{latest_ocr['frequency_name']}\n"
-                    f"💊 劑量：{latest_ocr['dose_quantity']} {latest_ocr['dosage_unit'] or ''}\n"
+                    f"💊 劑量：{latest_ocr['dose_quantity']} 顆 \n"
                     f"📆 天數：{latest_ocr['days']}\n\n"
                     f"是否要根據這筆資料建立提醒？"
                 ),
@@ -539,7 +546,7 @@ def handle_postback_event(event):
             "member": data["member"],
             "medicine_name": data["drug_name_zh"],
             "frequency_code": data["frequency_code"],
-            "dosage": f"{data['dose_quantity']} {data['dosage_unit'] or ''}",
+            "dosage": f"{data['dose_quantity']}" ,
             "days": data["days"],
             "times": []
         })
