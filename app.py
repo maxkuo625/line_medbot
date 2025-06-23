@@ -252,6 +252,57 @@ def handle_message(event):
     if message_text == "提醒用藥主選單":
         flex_message = create_main_medication_menu()
         line_bot_api.reply_message(event.reply_token, flex_message)
+    elif message_text == "選擇頻率":
+        conn = get_conn()
+        cursor = conn.cursor(dictionary=True)
+        line_user_id = event.source.user_id
+
+        cursor.execute("""
+            SELECT 
+                mr.member, 
+                mr.drug_name_zh, 
+                mr.frequency_count_code AS frequency_code, 
+                fc.frequency_name,
+                mr.dose_quantity, 
+                mr.dosage_unit, 
+                mr.days
+            FROM medication_record mr
+            LEFT JOIN frequency_code fc ON mr.frequency_count_code = fc.frequency_code
+            WHERE mr.recorder_id = %s AND mr.source_detail = 'OCR_Scan'
+            ORDER BY mr.created_at DESC
+            LIMIT 1
+        """, (line_user_id,))
+
+        latest_ocr = cursor.fetchone()
+        conn.close()
+
+        if latest_ocr:
+            # 提示用戶是否要使用這筆 OCR 的資料
+            set_temp_state(line_user_id, {
+                "state": "OCR_PENDING_CONFIRM",
+                "ocr_data": latest_ocr  # 暫存查出來的 dict 結果
+            })
+
+            reply_message(reply_token, TextSendMessage(
+                text=(
+                    f"📄 偵測到最近一次藥袋辨識資料：\n"
+                    f"👤 用藥對象：{latest_ocr['member']}\n"
+                    f"💊 藥品：{latest_ocr['drug_name_zh']}\n"
+                    f"🔁 頻率：{latest_ocr['frequency_name']}\n"
+                    f"💊 劑量：{latest_ocr['dose_quantity']} {latest_ocr['dosage_unit'] or ''}\n"
+                    f"📆 天數：{latest_ocr['days']}\n\n"
+                    f"是否要根據這筆資料建立提醒？"
+                ),
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=PostbackAction(label="✅ 是", data="action=confirm_use_ocr_from_db")),
+                    QuickReplyButton(action=PostbackAction(label="❌ 否", data="action=reject_use_ocr_from_db"))
+                ])
+            ))
+        else:
+            # 沒有 OCR 結果 ➜ 回到一般新增流程
+            set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_REMINDER"})
+            reply_message(reply_token, create_patient_selection_message(line_user_id, context="add_reminder"))
+
     elif message_text == "家人管理":
         line_bot_api.reply_message(reply_token, create_family_management_menu())
     elif message_text == "用藥管理":
@@ -478,6 +529,37 @@ def handle_postback_event(event):
                 text="❌ 解除綁定失敗，請稍後再試。"
             ))
 
+    elif action == "confirm_use_ocr_from_db":
+        temp = get_temp_state(line_user_id)
+        data = temp.get("ocr_data", {})
+    
+        # 進入建立提醒流程
+        set_temp_state(line_user_id, {
+            "state": "AWAITING_TIME_SELECTION",
+            "member": data["member"],
+            "medicine_name": data["drug_name_zh"],
+            "frequency_code": data["frequency_code"],
+            "dosage": f"{data['dose_quantity']} {data['dosage_unit'] or ''}",
+            "days": data["days"],
+            "times": []
+        })
+
+        # 提示選擇時間
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(
+                text="請選擇第一個提醒時間：",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=DatetimePickerAction(label="➕ 選擇時間", data="action=set_time", mode="time")),
+                    QuickReplyButton(action=PostbackAction(label="✅ 完成", data="action=finish_time_selection"))
+                ])
+            )
+        )
+
+    elif action == "reject_use_ocr_from_db":
+        clear_temp_state(line_user_id)
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_REMINDER"})
+        reply_message(reply_token, create_patient_selection_message(line_user_id, context="add_reminder"))
 
     # ✅ set_time 處理時間新增（根據 frequency_code 限制）
     if action == "set_time" and state == "AWAITING_TIME_SELECTION":
