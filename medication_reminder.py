@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import re
-import json
 from urllib.parse import quote, parse_qs
 
 from database import get_conn
@@ -10,16 +9,10 @@ from linebot.models import (
 )
 from linebot.exceptions import LineBotApiError
 from models import (
-    get_all_family_user_ids, get_medicine_list,
     get_temp_state, set_temp_state, clear_temp_state,
-    delete_medication_reminder_time,
-    get_medication_reminders_for_user,
-    get_medicine_id_by_name,
-    add_medication_record,
-    get_frequency_name,
-    add_medication_reminder_full,
-    create_user_if_not_exists,
-    get_all_frequency_options,
+    get_medication_reminders_for_user,get_medicine_id_by_name,
+    add_medication_record,get_frequency_name,get_frequency_code,
+    add_medication_reminder_full,get_all_frequency_options,
     get_reminder_times_for_user
 )
 import logging # For logging
@@ -633,12 +626,15 @@ def handle_postback(event, line_bot_api, user_states):
                     times.append(raw.strftime('%H:%M'))
                 else:
                     times.append(str(raw))
+        frequency_name = reminder["frequency_name"]
+        frequency_code = get_frequency_code(frequency_name)  # 將中文頻率名稱轉為英文代碼
+
 
         set_temp_state(line_user_id, {
             "state": "AWAITING_TIME_SELECTION",
             "member": member,
             "medicine_name": reminder.get("medicine_name", "未命名藥品"),
-            "frequency_code": frequency_name,
+            "frequency_code": frequency_code,
             "dosage": reminder.get("dose_quantity", ""),
             "days": reminder.get("days", 1),
             "times": times,

@@ -691,7 +691,6 @@ def handle_postback_event(event):
             )
         )
 
-    # ✅ finish_time_selection - 顯示中文頻率名稱於結果中
     elif action == "finish_time_selection" and state == "AWAITING_TIME_SELECTION":
         times = current_state_info.get("times", [])
         if not times:
@@ -699,7 +698,6 @@ def handle_postback_event(event):
             return
 
         try:
-            # 修改後：只在新增時檢查所有欄位，修改只檢查必要欄位
             if current_state_info.get("is_edit"):
                 required_fields = ["member", "medicine_name", "frequency_code"]
             else:
@@ -715,12 +713,11 @@ def handle_postback_event(event):
             member = current_state_info["member"]
             medicine_name = current_state_info["medicine_name"]
             frequency_code = current_state_info["frequency_code"]
+            dosage = current_state_info.get("dosage", "")
+            days = current_state_info.get("days", 1)
             frequency_name = get_frequency_name_by_code(frequency_code)
-            dosage = current_state_info["dosage"]
-            days = current_state_info["days"]
 
             if current_state_info.get("is_edit"):
-                # 修改提醒邏輯
                 update_medication_reminder_times(
                     recorder_id=line_user_id,
                     member=member,
@@ -729,7 +726,6 @@ def handle_postback_event(event):
                 )
                 result_text = "✅ 提醒時間已成功修改！"
             else:
-                # 新增提醒邏輯
                 add_medication_reminder_full(
                     recorder_id=line_user_id,
                     member=member,
@@ -744,18 +740,16 @@ def handle_postback_event(event):
             clear_temp_state(line_user_id)
             line_bot_api.reply_message(reply_token, TextSendMessage(
                 text=(f"{result_text}\n"
-                     f"👤 用藥對象：{member}\n"
-                    f"💊 藥品：{medicine_name}\n"
-                    f"🔁 頻率：{frequency_name}（{frequency_code}）\n"
-                    f"📆 天數：{days}\n"
-                    f"🕒 時間：{', '.join(times)}")
+                      f"👤 用藥對象：{member}\n"
+                      f"💊 藥品：{medicine_name}\n"
+                      f"🔁 頻率：{frequency_name}（{frequency_code}）\n"
+                      f"📆 天數：{days}\n"
+                      f"🕒 時間：{', '.join(times)}")
             ))
         except Exception as e:
             app.logger.error(f"提醒處理失敗：{e}")
             traceback.print_exc()
             line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 設定提醒時發生錯誤，請稍後再試。"))
-
-
 
     if action == "show_medication_management_menu":
         reply_message(reply_token, create_medication_management_menu(line_user_id))
