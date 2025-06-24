@@ -672,30 +672,45 @@ def handle_postback(event, line_bot_api, user_states):
 
 
     elif action == "select_patient_for_reminder":
-        member = params.get('member')
-        context = params.get("context")
+            member = params.get('member')
+            context = params.get("context")
 
-        if not member:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
-            return
+            if not member:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+                return
 
-        if context == "query_reminder":
-            _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+            if context == "query_reminder":
+                _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+                return
 
-        elif context == "add_reminder":
-            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
-            line_bot_api.reply_message(reply_token, TextSendMessage(
-                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
-                quick_reply=QuickReply(items=[
-                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
-                    QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
-                ])
-            ))
+            elif context == "add_reminder":
+                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                    quick_reply=QuickReply(items=[
+                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                    ])
+                ))
+                return
 
-        elif context == "edit_time":
-            reply_msg = create_edit_time_action_menu(member)
-        set_temp_state(line_user_id, {"state": "AWAITING_EDIT_TIME_ACTION", "member": member})
-        line_bot_api.reply_message(reply_token, reply_msg)
+            elif context == "edit_time":
+                reply_msg = create_edit_time_action_menu(member)
+                set_temp_state(line_user_id, {"state": "AWAITING_EDIT_TIME_ACTION", "member": member})
+                line_bot_api.reply_message(reply_token, reply_msg)
+                return
+
+            else:
+                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                    quick_reply=QuickReply(items=[
+                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                    ])
+                ))
+                return
+
 
     elif action == "edit_selected_reminder":
         member = params.get("member")
