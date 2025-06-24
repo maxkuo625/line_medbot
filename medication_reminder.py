@@ -330,7 +330,11 @@ def get_patient_id_by_member_name(line_id: str, member_name: str):
 
 
 def _display_medication_reminders(reply_token, line_bot_api, line_user_id, member):
-    from models import get_reminder_times_for_user
+    from database import get_conn
+    from linebot.models import TextSendMessage, QuickReply, QuickReplyButton, PostbackAction
+    import logging
+    from urllib.parse import quote
+    from models import clear_temp_state
 
     conn = get_conn()
     if not conn:
@@ -339,17 +343,20 @@ def _display_medication_reminders(reply_token, line_bot_api, line_user_id, membe
 
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT recorder_id, member FROM patients WHERE recorder_id = %s AND member = %s",
-            (line_user_id, member)
-        )
-        patient = cursor.fetchone()
-        if not patient:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的用藥者資料。"))
-            return
+        cursor.execute("""
+            SELECT DISTINCT rt.frequency_name,
+                   rt.time_slot_1, rt.time_slot_2, rt.time_slot_3, rt.time_slot_4,
+                   mr.drug_name_zh AS medicine_name
+            FROM reminder_time rt
+            LEFT JOIN frequency_code fc ON rt.frequency_name = fc.frequency_name
+            LEFT JOIN medication_record mr
+              ON rt.recorder_id = mr.recorder_id
+             AND rt.member = mr.member
+             AND mr.frequency_count_code = fc.frequency_code
+            WHERE rt.recorder_id = %s AND rt.member = %s
+        """, (line_user_id, member))
 
-        # ✅ 改為從 reminder_time 抓資料
-        reminders = get_reminder_times_for_user(line_user_id, member)
+        reminders = cursor.fetchall()
         if not reminders:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=f"「{member}」目前沒有設定任何用藥提醒。"))
             return
@@ -359,8 +366,8 @@ def _display_medication_reminders(reply_token, line_bot_api, line_user_id, membe
 
         for r in reminders:
             frequency_name = r.get('frequency_name', '未知頻率')
+            medicine_name = r.get('medicine_name', '未命名藥品')
 
-            # 將時間欄位轉為字串
             times = []
             for i in range(1, 5):
                 raw_time = r.get(f'time_slot_{i}')
@@ -371,11 +378,11 @@ def _display_medication_reminders(reply_token, line_bot_api, line_user_id, membe
                         times.append(raw_time.strftime('%H:%M'))
                     else:
                         times.append(str(raw_time))
+
             time_str = '、'.join(times) if times else '未設定'
 
-            reminder_messages.append(f"頻率：{frequency_name}\n時間：{time_str}")
+            reminder_messages.append(f"藥品：{medicine_name}\n頻率：{frequency_name}\n時間：{time_str}")
 
-            # 🔘 為每個頻率新增一個刪除按鈕
             quick_reply_buttons.append(
                 QuickReplyButton(
                     action=PostbackAction(
@@ -385,7 +392,6 @@ def _display_medication_reminders(reply_token, line_bot_api, line_user_id, membe
                 )
             )
 
-        # 組裝最終訊息
         message = TextSendMessage(
             text=f"「{member}」的用藥提醒：\n" + "\n---\n".join(reminder_messages),
             quick_reply=QuickReply(items=quick_reply_buttons)
@@ -403,6 +409,7 @@ def _display_medication_reminders(reply_token, line_bot_api, line_user_id, membe
     finally:
         if conn and conn.is_connected():
             conn.close()
+
 
 
 
