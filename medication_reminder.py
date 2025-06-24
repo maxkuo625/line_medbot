@@ -129,21 +129,19 @@ def run_reminders(line_bot_api):
 # 用藥者管理相關功能
 # ------------------------------------------------------------
 
-def create_patient_selection_message(line_id: str, context: str = None): # Modified signature
+def create_patient_selection_message(line_id: str, context: str = None):
     conn = get_conn()
     if not conn:
-        return TextSendMessage(text="抱歉，無法連接到使用者資料庫。")
+        return TextSendMessage(text="抱歉，無法連線到使用者資料庫。")
     items = []
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT recorder_id FROM users WHERE recorder_id = %s", (line_id,))
         user = cursor.fetchone()
-        
         if not user:
             cursor.execute("INSERT INTO users (recorder_id, user_name) VALUES (%s, %s)", (line_id, "新用戶"))
             conn.commit()
             current_recorder_id = line_id
-            
             cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
             conn.commit()
             existing_patients = [{'member': '本人'}]
@@ -151,7 +149,6 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
             current_recorder_id = user['recorder_id']
             cursor.execute("SELECT member FROM patients WHERE recorder_id = %s", (current_recorder_id,))
             existing_patients = cursor.fetchall()
-            
             if not existing_patients:
                 cursor.execute("INSERT INTO patients (recorder_id, member) VALUES (%s, %s)", (current_recorder_id, "本人"))
                 conn.commit()
@@ -159,9 +156,9 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
 
         for patient in existing_patients:
             postback_data = f"action=select_patient_for_reminder&member={quote(patient['member'])}"
-            display_text_label = f"選擇 {patient['member']}" # Default display text
+            display_text_label = f"選擇 {patient['member']}"
 
-            if context: # Only append context if it's provided
+            if context:
                 postback_data += f"&context={context}"
 
             if context == "add_reminder":
@@ -170,6 +167,8 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
                 display_text_label = f"查詢「{patient['member']}」的提醒"
             elif context == "manage_reminders":
                 display_text_label = f"管理「{patient['member']}」的提醒"
+            elif context == "edit_time":
+                display_text_label = f"設定「{patient['member']}」的提醒時間"
 
             items.append(
                 QuickReplyButton(
@@ -180,6 +179,7 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
                     )
                 )
             )
+
         if len(existing_patients) < 4:
             items.append(
                 QuickReplyButton(
@@ -190,6 +190,7 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
                     )
                 )
             )
+
     except Exception as e:
         logging.error(f"Error in create_patient_selection_message: {e}")
         import traceback
@@ -199,12 +200,32 @@ def create_patient_selection_message(line_id: str, context: str = None): # Modif
         if conn and conn.is_connected():
             conn.close()
 
+    prompt = {
+        "add_reminder": "請問這份藥單是給誰的？",
+        "query_reminder": "請問您想查詢誰的用藥時間？",
+        "manage_reminders": "請問您想管理誰的用藥提醒？",
+        "edit_time": "請問您想為誰設定用藥提醒時間？"
+    }.get(context, "請選擇用藥對象：")
+
+    return TextSendMessage(text=prompt, quick_reply=QuickReply(items=items))
+
+def create_edit_time_action_menu(member):
     return TextSendMessage(
-        text="請問這份藥單是給誰的？" if context == "add_reminder" else
-             "請問您想查詢誰的用藥時間？" if context == "query_reminder" else
-             "請問您想管理誰的用藥提醒？" if context == "manage_reminders" else
-             "請選擇用藥對象：", # Default if context is not specifically handled
-        quick_reply=QuickReply(items=items)
+        text=f"您想對「{member}」進行什麼操作？",
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="新增提醒時間",
+                    data=f"action=select_edit_type&member={quote(member)}&edit_type=add"
+                )
+            ),
+            QuickReplyButton(
+                action=PostbackAction(
+                    label="刪除提醒時間",
+                    data=f"action=select_edit_type&member={quote(member)}&edit_type=delete"
+                )
+            )
+        ])
     )
 
 def create_medication_management_menu(line_id: str):
@@ -544,31 +565,18 @@ def handle_postback(event, line_bot_api, user_states):
     postback_data = event.postback.data
     params = {k: v[0] for k, v in parse_qs(postback_data).items()}
     action = params.get("action")
-    context = params.get("context") # Get the context
-    current_state_info = get_temp_state(line_user_id) # Using get_temp_state from models
+    context = params.get("context")
+    current_state_info = get_temp_state(line_user_id)
 
-    if action == "select_patient_for_reminder":
-        member = params.get('member')
-        context = params.get("context")
+    if action == "select_edit_type":
+        member = params.get("member")
+        edit_type = params.get("edit_type")
 
-        if not member:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+        if not member or not edit_type:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 缺少參數，請重新選擇。"))
             return
 
-        if context == "query_reminder":
-            _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
-
-        elif context == "add_reminder":
-            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
-            line_bot_api.reply_message(reply_token, TextSendMessage(
-                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
-                quick_reply=QuickReply(items=[
-                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
-                    QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
-                ])
-            ))
-
-        elif context == "edit_time":
+        if edit_type == "add":
             reminders = get_reminder_times_for_user(line_user_id, member)
             if not reminders:
                 line_bot_api.reply_message(reply_token, TextSendMessage(text=f"「{member}」目前沒有提醒可修改。"))
@@ -591,7 +599,22 @@ def handle_postback(event, line_bot_api, user_states):
                 quick_reply=QuickReply(items=quick_buttons)
             ))
 
-        else:
+        elif edit_type == "delete":
+            from medication_reminder import _display_medication_reminders
+            _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+
+    elif action == "select_patient_for_reminder":
+        member = params.get('member')
+        context = params.get("context")
+
+        if not member:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+            return
+
+        if context == "query_reminder":
+            _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+
+        elif context == "add_reminder":
             set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
             line_bot_api.reply_message(reply_token, TextSendMessage(
                 text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
@@ -600,6 +623,11 @@ def handle_postback(event, line_bot_api, user_states):
                     QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
                 ])
             ))
+
+        elif context == "edit_time":
+            reply_msg = create_edit_time_action_menu(member)
+        set_temp_state(line_user_id, {"state": "AWAITING_EDIT_TIME_ACTION", "member": member})
+        line_bot_api.reply_message(reply_token, reply_msg)
 
     elif action == "edit_selected_reminder":
         member = params.get("member")
