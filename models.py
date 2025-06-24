@@ -534,6 +534,39 @@ def add_medication_reminder_full(recorder_id, member, medicine_name, frequency_c
             cursor.close()
             conn.close()
 
+def update_medication_reminder_times(recorder_id, member, frequency_code, new_times):
+    """
+    更新 reminder_time 表中指定用戶與用藥對象的時間欄位。
+    """
+    conn = get_conn()
+    cursor = conn.cursor()
+    try:
+        frequency_name = get_frequency_name(frequency_code)
+        time_slots = [None] * 4
+        for i, t in enumerate(new_times[:4]):
+            time_slots[i] = t
+
+        total_doses = len([t for t in time_slots if t])
+
+        cursor.execute("""
+            UPDATE reminder_time
+            SET time_slot_1 = %s, time_slot_2 = %s, time_slot_3 = %s, time_slot_4 = %s,
+                total_doses_per_day = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+        """, (
+            *time_slots, total_doses,
+            recorder_id, member, frequency_name
+        ))
+        conn.commit()
+        print(f"✅ 提醒時間更新成功：{recorder_id} - {member} - {frequency_name}")
+    except Exception as e:
+        print(f"❌ 更新提醒時間失敗：{e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
+
 
 def get_reminder_times_for_user(recorder_id, member):
     """

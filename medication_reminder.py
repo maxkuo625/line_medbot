@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import json
 from urllib.parse import quote, parse_qs
@@ -556,32 +556,103 @@ def handle_postback(event, line_bot_api, user_states):
 
     if action == "select_patient_for_reminder":
         member = params.get('member')
-        if member:
-            if context == "query_reminder":
-                # User selected patient for query
-                _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
-            elif context == "add_reminder": # Or if context is None, default to add_reminder
-                # User selected patient for adding a reminder (OCR or manual)
-                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
-                    quick_reply=QuickReply(items=[
-                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
-                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
-                    ])
-                ))
-            else: # Fallback for unclear context, perhaps a new scenario or old state
-                # Default to the "add reminder" flow if context is ambiguous or not provided
-                set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
-                    quick_reply=QuickReply(items=[
-                        QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
-                        QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
-                    ])
-                ))
-        else:
+        context = params.get("context")
+
+        if not member:
             line_bot_api.reply_message(reply_token, TextSendMessage(text="請選擇一個用藥對象。"))
+            return
+
+        if context == "query_reminder":
+            _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+
+        elif context == "add_reminder":
+            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                    QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                ])
+            ))
+
+        elif context == "edit_time":
+            reminders = get_reminder_times_for_user(line_user_id, member)
+            if not reminders:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"「{member}」目前沒有提醒可修改。"))
+                return
+
+            quick_buttons = []
+            for r in reminders:
+                freq = r.get('frequency_name', '未知頻率')
+                med_name = r.get('medicine_name', '未命名藥品')
+                label = f"{med_name}-{freq}"
+                quick_buttons.append(QuickReplyButton(
+                    action=PostbackAction(
+                        label=label,
+                        data=f"action=edit_selected_reminder&member={quote(member)}&frequency_name={quote(freq)}"
+                    )
+                ))
+
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"請選擇要修改哪一筆提醒（{member}）：",
+                quick_reply=QuickReply(items=quick_buttons)
+            ))
+
+        else:
+            set_temp_state(line_user_id, {"state": "AWAITING_MED_SCAN_OR_INPUT", "member": member})
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"已選擇用藥對象為「{member}」。請上傳藥單照片或手動輸入藥品資訊。",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="手動輸入藥品", text="手動輸入藥品")),
+                    QuickReplyButton(action=MessageAction(label="藥袋辨識", text="藥袋辨識"))
+                ])
+            ))
+
+    elif action == "edit_selected_reminder":
+        member = params.get("member")
+        frequency_name = params.get("frequency_name")
+        reminders = get_reminder_times_for_user(line_user_id, member)
+        reminder = next((r for r in reminders if r["frequency_name"] == frequency_name), None)
+
+        if not reminder:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到指定的提醒資訊，請重新選擇。"))
+            return
+
+        times = []
+        for i in range(1, 5):
+            raw = reminder.get(f"time_slot_{i}")
+            if raw:
+                if isinstance(raw, str):
+                    times.append(raw)
+                elif isinstance(raw, timedelta):
+                    total_seconds = int(raw.total_seconds())
+                    hours = total_seconds // 3600
+                    minutes = (total_seconds % 3600) // 60
+                    times.append(f"{hours:02d}:{minutes:02d}")
+                elif hasattr(raw, 'strftime'):
+                    times.append(raw.strftime('%H:%M'))
+                else:
+                    times.append(str(raw))
+
+        set_temp_state(line_user_id, {
+            "state": "AWAITING_TIME_SELECTION",
+            "member": member,
+            "medicine_name": reminder.get("medicine_name", "未命名藥品"),
+            "frequency_code": frequency_name,
+            "dosage": reminder.get("dose_quantity", ""),
+            "days": reminder.get("days", 1),
+            "times": times,
+            "is_edit": True
+        })
+
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text="請修改提醒時間：",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=DatetimePickerAction(label="➕ 選擇時間", data="action=set_time", mode="time")),
+                QuickReplyButton(action=PostbackAction(label="✅ 完成", data="action=finish_time_selection"))
+            ])
+        ))
+
     elif action == "delete_single_reminder":
         member = params.get("member")
         frequency_name = params.get("frequency_name")

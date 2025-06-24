@@ -18,7 +18,7 @@ from scheduler import start_scheduler
 from models import (
     set_temp_state, clear_temp_state, get_temp_state, add_medication_reminder_full,
     get_times_per_day_by_code, get_frequency_name_by_code, bind_family,unbind_family,
-    create_user_if_not_exists
+    create_user_if_not_exists, update_medication_reminder_times
 )
 from database import get_conn
 import json
@@ -234,6 +234,11 @@ def handle_message(event):
     current_state_info = get_temp_state(line_user_id) or {}
     state = current_state_info.get("state")
 
+    if message_text == "修改時間":
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_EDIT_TIME"})
+        reply_msg = create_patient_selection_message(line_user_id, context="edit_time")
+        line_bot_api.reply_message(reply_token, reply_msg)
+
     if message_text.startswith("綁定 "):
         match = re.match(r"綁定\s*(\w+)", message_text)
         if match:
@@ -252,6 +257,11 @@ def handle_message(event):
     if message_text == "提醒用藥主選單":
         flex_message = create_main_medication_menu()
         line_bot_api.reply_message(event.reply_token, flex_message)
+    
+    elif message_text == "修改時間":
+        set_temp_state(line_user_id, {"state": "AWAITING_PATIENT_FOR_EDIT_TIME"})
+        reply_message(reply_token, create_patient_selection_message(line_user_id, context="edit_time"))
+
     elif message_text == "選擇頻率":
         conn = get_conn()
         cursor = conn.cursor(dictionary=True)
@@ -686,44 +696,65 @@ def handle_postback_event(event):
         times = current_state_info.get("times", [])
         if not times:
             line_bot_api.reply_message(reply_token, TextSendMessage(text="尚未輸入任何時間，請至少選擇一個時間。"))
-        else:
-            try:
+            return
+
+        try:
+            # 修改後：只在新增時檢查所有欄位，修改只檢查必要欄位
+            if current_state_info.get("is_edit"):
+                required_fields = ["member", "medicine_name", "frequency_code"]
+            else:
                 required_fields = ["member", "medicine_name", "frequency_code", "dosage", "days"]
-                missing = [f for f in required_fields if not current_state_info.get(f)]
-                if missing:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(
-                        text=f"❗ 資料不完整，缺少欄位：{', '.join(missing)}，請重新設定提醒流程。"
-                    ))
-                    return
 
-                frequency_code = current_state_info["frequency_code"]
-                frequency_name = get_frequency_name_by_code(frequency_code)
+            missing = [f for f in required_fields if not current_state_info.get(f)]
+            if missing:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"❗ 資料不完整，缺少欄位：{', '.join(missing)}，請重新設定提醒流程。"
+                ))
+                return
 
+            member = current_state_info["member"]
+            medicine_name = current_state_info["medicine_name"]
+            frequency_code = current_state_info["frequency_code"]
+            frequency_name = get_frequency_name_by_code(frequency_code)
+            dosage = current_state_info["dosage"]
+            days = current_state_info["days"]
+
+            if current_state_info.get("is_edit"):
+                # 修改提醒邏輯
+                update_medication_reminder_times(
+                    recorder_id=line_user_id,
+                    member=member,
+                    frequency_code=frequency_code,
+                    new_times=times
+                )
+                result_text = "✅ 提醒時間已成功修改！"
+            else:
+                # 新增提醒邏輯
                 add_medication_reminder_full(
                     recorder_id=line_user_id,
-                    member=current_state_info["member"],
-                    medicine_name=current_state_info["medicine_name"],
+                    member=member,
+                    medicine_name=medicine_name,
                     frequency_code=frequency_code,
-                    dosage=current_state_info["dosage"],
-                    days=current_state_info["days"],
+                    dosage=dosage,
+                    days=days,
                     times=times
                 )
+                result_text = "✅ 提醒已建立成功！"
 
-                clear_temp_state(line_user_id)
-                line_bot_api.reply_message(reply_token, TextSendMessage(
-                    text=(
-                        f"✅ 提醒已建立成功！\n"
-                        f"👤 用藥對象：{current_state_info['member']}\n"
-                        f"💊 藥品：{current_state_info['medicine_name']}\n"
-                        f"🔁 頻率：{frequency_name}（{frequency_code}）\n"
-                        f"📆 天數：{current_state_info['days']}\n"
-                        f"🕒 時間：{', '.join(times)}"
-                    )
-                ))
-            except Exception as e:
-                app.logger.error(f"建立提醒失敗：{e}")
-                traceback.print_exc()
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 建立提醒時發生錯誤，請稍後再試。"))
+            clear_temp_state(line_user_id)
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=(f"{result_text}\n"
+                     f"👤 用藥對象：{member}\n"
+                    f"💊 藥品：{medicine_name}\n"
+                    f"🔁 頻率：{frequency_name}（{frequency_code}）\n"
+                    f"📆 天數：{days}\n"
+                    f"🕒 時間：{', '.join(times)}")
+            ))
+        except Exception as e:
+            app.logger.error(f"提醒處理失敗：{e}")
+            traceback.print_exc()
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 設定提醒時發生錯誤，請稍後再試。"))
+
 
 
     if action == "show_medication_management_menu":
