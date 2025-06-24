@@ -280,9 +280,52 @@ def unbind_family(line_user_id, target_user_id):
         conn.close()
 
 
-# ========================\
-# 💊 用藥提醒設定 (主要的修改部分)
-# ========================\
+# ========================
+# 💊 用藥提醒設定
+# ========================
+
+def clear_single_time_slot(recorder_id, member, frequency_name, time_str):
+    conn = get_conn()
+    if not conn:
+        return False
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT time_slot_1, time_slot_2, time_slot_3, time_slot_4
+            FROM reminder_time
+            WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+        """, (recorder_id, member, frequency_name))
+
+        row = cursor.fetchone()
+        if not row:
+            return False
+
+        for i in range(1, 5):
+            time_slot = row.get(f"time_slot_{i}")
+            if time_slot:
+                if hasattr(time_slot, 'strftime'):
+                    time_val = time_slot.strftime("%H:%M")
+                else:
+                    time_val = str(time_slot)
+                if time_val == time_str:
+                    cursor.execute(f"""
+                        UPDATE reminder_time
+                        SET time_slot_{i} = NULL
+                        WHERE recorder_id = %s AND member = %s AND frequency_name = %s
+                    """, (recorder_id, member, frequency_name))
+                    conn.commit()
+                    return True
+        return False
+
+    except Exception as e:
+        import logging
+        logging.error(f"clear_single_time_slot error: {e}")
+        return False
+    finally:
+        if conn.is_connected():
+            conn.close()
+
 
 def get_suggested_times_by_frequency(frequency_code):
     """

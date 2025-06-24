@@ -13,7 +13,7 @@ from models import (
     get_medication_reminders_for_user,get_medicine_id_by_name,
     add_medication_record,get_frequency_name,get_frequency_code,
     add_medication_reminder_full,get_all_frequency_options,
-    get_reminder_times_for_user
+    get_reminder_times_for_user, clear_single_time_slot
 )
 import logging # For logging
 
@@ -330,7 +330,7 @@ def get_patient_id_by_member_name(line_id: str, member_name: str):
 
 
 def _display_medication_reminders(reply_token, line_bot_api, line_user_id, member):
-    from models import get_reminder_times_for_user, delete_medication_reminder_time  # 確保匯入
+    from models import get_reminder_times_for_user
 
     conn = get_conn()
     if not conn:
@@ -557,7 +557,7 @@ def handle_medication_record_time_selected(reply_token, line_bot_api, user_id, t
 
 
 # ------------------------------------------------------------
-# 處理 Postback 事件 (Existing code - modified to include new actions)
+# 處理 Postback 事件
 # ------------------------------------------------------------
 def handle_postback(event, line_bot_api, user_states):
     reply_token = event.reply_token
@@ -600,8 +600,69 @@ def handle_postback(event, line_bot_api, user_states):
             ))
 
         elif edit_type == "delete":
-            from medication_reminder import _display_medication_reminders
             _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+    
+    elif action == "delete_single_reminder":
+        member = params.get("member")
+        frequency_name = params.get("frequency_name")
+
+        if not member or not frequency_name:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 缺少刪除參數，請重試。"))
+            return
+
+        # ✅ 顯示每個時間點讓使用者選擇要刪除哪一個時間
+        reminders = get_reminder_times_for_user(line_user_id, member)
+        reminder = next((r for r in reminders if r["frequency_name"] == frequency_name), None)
+
+        if not reminder:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到「{member}」的 {frequency_name} 提醒資料。"))
+            return
+
+        time_buttons = []
+        for i in range(1, 5):
+            time_value = reminder.get(f"time_slot_{i}")
+            if time_value:
+                if hasattr(time_value, 'strftime'):
+                    time_str = time_value.strftime("%H:%M")
+                else:
+                    time_str = str(time_value)
+
+                time_buttons.append(
+                    QuickReplyButton(
+                        action=PostbackAction(
+                            label=f"刪除 {time_str}",
+                            data=f"action=delete_time_slot&member={quote(member)}&frequency_name={quote(frequency_name)}&time={time_str}"
+                        )
+                    )
+                )
+
+        if not time_buttons:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="該提醒沒有可刪除的時間。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"請選擇要刪除的提醒時間（{member} - {frequency_name}）：",
+                quick_reply=QuickReply(items=time_buttons)
+            ))
+
+    elif action == "delete_time_slot":
+        member = params.get("member")
+        frequency_name = params.get("frequency_name")
+        time_str = params.get("time")
+
+        if not member or not frequency_name or not time_str:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 缺少刪除時間參數，請重試。"))
+            return
+
+        success = clear_single_time_slot(line_user_id, member, frequency_name, time_str)
+
+        if success:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"✅ 已成功刪除提醒時間 {time_str}"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 找不到對應時間或刪除失敗。"))
+
+        # 重新顯示當前提醒
+        _display_medication_reminders(reply_token, line_bot_api, line_user_id, member)
+
 
     elif action == "select_patient_for_reminder":
         member = params.get('member')
