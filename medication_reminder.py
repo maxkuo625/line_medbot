@@ -16,6 +16,7 @@ from models import (
     get_reminder_times_for_user, clear_single_time_slot
 )
 import logging # For logging
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,6 +55,7 @@ def create_frequency_quickreply():
 # ------------------------------------------------------------
 # 執行用藥提醒
 # ------------------------------------------------------------
+
 def run_reminders(line_bot_api):
     logging.info(f"正在執行提醒任務，當前時間: {datetime.now().strftime('%H:%M')}")
     conn = get_conn()
@@ -63,66 +65,83 @@ def run_reminders(line_bot_api):
 
     try:
         cursor = conn.cursor(dictionary=True)
-        current_time_str = datetime.now().strftime('%H:%M:%S')
-        display_time = datetime.now().strftime('%H:%M')
+        current_time_str = datetime.now().strftime('%H:%M')
 
         query = """
-        SELECT
-            rt.recorder_id AS line_user_id,
-            rt.member,
-            fc.frequency_name,
-            mr.dose_quantity,
-            di.drug_name_zh AS medicine_name
-        FROM
-            reminder_time rt
-        JOIN
-            medication_record mr ON rt.recorder_id = mr.recorder_id
-                                AND rt.member = mr.member
-                                AND rt.frequency_name = mr.frequency_count_code
-        LEFT JOIN
-            drug_info di ON mr.drug_name_zh = di.drug_name_zh
-        JOIN
-            frequency_code fc ON rt.frequency_name = fc.frequency_code
-        WHERE
-            TIME(%s) IN (
-                TIME(rt.time_slot_1),
-                TIME(rt.time_slot_2),
-                TIME(rt.time_slot_3)
-            )
+            SELECT
+                rt.recorder_id AS recorder_id,
+                rt.member,
+                p.linked_user_id,
+                fc.frequency_name,
+                mr.dose_quantity,
+                COALESCE(di.drug_name_zh, mr.drug_name_zh) AS medicine_name
+            FROM reminder_time rt
+            JOIN patients p ON rt.recorder_id = p.recorder_id AND rt.member = p.member
+            JOIN frequency_code fc ON rt.frequency_name = fc.frequency_name
+            JOIN medication_record mr ON rt.recorder_id = mr.recorder_id
+                              AND rt.member = mr.member
+                              AND mr.frequency_count_code = fc.frequency_code
+            LEFT JOIN drug_info di ON mr.drug_name_zh = di.drug_name_zh
+            WHERE DATE_FORMAT(rt.time_slot_1, '%H:%i') = %s
+            OR DATE_FORMAT(rt.time_slot_2, '%H:%i') = %s
+            OR DATE_FORMAT(rt.time_slot_3, '%H:%i') = %s
+            OR DATE_FORMAT(rt.time_slot_4, '%H:%i') = %s
         """
 
-        cursor.execute(query, (current_time_str,))
+        cursor.execute(query, (current_time_str, current_time_str, current_time_str, current_time_str))
         reminders = cursor.fetchall()
 
-        if not reminders:
-            logging.info("目前沒有需要發送的提醒。")
-            return
+        # ✅ 將提醒依照使用者分組並合併同藥品
+        grouped_by_user = defaultdict(lambda: {"member": "", "linked_user_id": "", "medicines": {}})
 
-        for reminder in reminders:
-            line_user_id = reminder["line_user_id"]
-            member = reminder["member"]
-            medicine_name = reminder["medicine_name"] or "（未命名藥品）"
-            frequency_name = reminder["frequency_name"]
-            dose_quantity = reminder["dose_quantity"]
-            # dosage_unit = reminder.get("dosage_unit") or ""
-            dose_str = f"{dose_quantity}" if dose_quantity else "未提供"
+        for r in reminders:
+            key = r["recorder_id"]
+            medicine = r["medicine_name"] or "未命名藥品"
+            grouped = grouped_by_user[key]
+            grouped["member"] = r["member"]
+            grouped["linked_user_id"] = r["linked_user_id"]
+
+            # 限制藥品名稱只出現一次
+            if medicine not in grouped["medicines"]:
+                grouped["medicines"][medicine] = {
+                    "dose_quantity": r["dose_quantity"] or "未提供",
+                    "frequency_name": r["frequency_name"] or "未知頻率"
+                }
+
+        # ✅ 建立與推播訊息
+        display_time = current_time_str
+        for recorder_id, info in grouped_by_user.items():
+            member = info["member"]
+            linked_user_id = info["linked_user_id"]
+            medicine_lines = [
+                f"- {name}（{med['dose_quantity']} 顆）"
+                for name, med in info["medicines"].items()
+            ]
 
             message_text = (
                 f"🔔 用藥時間到囉！\n"
                 f"👤 用藥者：{member}\n"
-                f"💊 藥品：{medicine_name}\n"
-                f"⏰ 頻率：{frequency_name}\n"
-                f"💊 劑量：{dose_str}\n"
-                f"⏰ 時間：{display_time}\n"
-                f"請記得按時服用喔！"
+                f"💊 需要服用的藥物如下：\n" +
+                "\n".join(medicine_lines) +
+                f"\n🕒 時間：{display_time}\n請記得按時服用喔！"
             )
 
-            line_bot_api.push_message(line_user_id, TextSendMessage(text=message_text))
+            try:
+                line_bot_api.push_message(recorder_id, TextSendMessage(text=message_text))
+                logging.info(f"📤 已通知照顧者 {recorder_id}")
+
+                if linked_user_id and linked_user_id != recorder_id:
+                    line_bot_api.push_message(linked_user_id, TextSendMessage(text=message_text))
+                    logging.info(f"📤 也通知被照顧者 {linked_user_id}")
+            except Exception as e:
+                logging.error(f"❌ 推播提醒失敗：{e}")
 
     except Exception as e:
-        logging.error(f"執行提醒任務時發生錯誤: {e}")
+        logging.error(f"❌ 提醒任務錯誤：{e}")
     finally:
         conn.close()
+
+
 
 
 # ------------------------------------------------------------

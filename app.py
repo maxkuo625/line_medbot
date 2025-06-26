@@ -509,26 +509,85 @@ def handle_postback_event(event):
 
     if action == "confirm_bind":
         code = params.get("code")
-        success, inviter = bind_family(code, line_user_id)
+        success, inviter_id = bind_family(code, line_user_id)
+
         if success:
             line_bot_api.reply_message(reply_token, TextSendMessage(
-                text=f"✅ 綁定成功！您已與帳號 {inviter[-6:]} 建立綁定。"
+                text=f"✅ 綁定成功！您已成功綁定 {inviter_id[-6:]}"
             ))
+
+            # 關係確認（排除本人）
+            conn = get_conn()
+            if conn:
+                try:
+                    cursor = conn.cursor(dictionary=True)
+                    cursor.execute("SELECT member FROM patients WHERE recorder_id = %s AND member != '本人'", (inviter_id,))
+                    members = cursor.fetchall()
+                    if members:
+                        from urllib.parse import quote
+                        quick_buttons = [
+                            QuickReplyButton(
+                                action=PostbackAction(
+                                    label=m['member'],
+                                    data=f"action=confirm_relationship&inviter_id={inviter_id}&member={quote(m['member'])}"
+                                )
+                            )
+                            for m in members
+                        ]
+
+                        line_bot_api.push_message(line_user_id, TextSendMessage(
+                            text="📌 這位邀請你的人跟你是什麼關係？",
+                            quick_reply=QuickReply(items=quick_buttons)
+                        ))
+                    else:
+                        line_bot_api.push_message(line_user_id, TextSendMessage(
+                            text="⚠️ 邀請人尚未設定家人，請通知對方先新增家人資料（不能僅有『本人』）。"
+                        ))
+                except Exception as e:
+                    app.logger.error(f"[confirm_bind] 錯誤：{e}")
+                finally:
+                    conn.close()
         else:
             line_bot_api.reply_message(reply_token, TextSendMessage(
                 text="❌ 綁定失敗，邀請碼無效或已使用或過期。"
             ))
-    elif action == "reject_bind":
-        line_bot_api.reply_message(reply_token, [
-            TextSendMessage(text="👌 已略過綁定流程。您仍可使用 BOT 的功能。"),
-            TextSendMessage(
-                text="請選擇下一步操作：",
-                quick_reply=QuickReply(items=[
-                    QuickReplyButton(action=MessageAction(label="家人管理", text="家人管理")),
-                    QuickReplyButton(action=MessageAction(label="提醒用藥主選單", text="提醒用藥主選單"))
-                ])
-            )
-        ])
+
+    elif action == "confirm_relationship":
+        inviter_id = params.get("inviter_id")
+        member = params.get("member")
+
+        if not inviter_id or not member:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❗ 綁定參數缺失，請重新操作。"))
+            return
+
+        try:
+            conn = get_conn()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE patients
+                SET linked_user_id = %s
+                WHERE recorder_id = %s AND member = %s
+            """, (line_user_id, inviter_id, member))
+            conn.commit()
+
+            if cursor.rowcount > 0:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text=f"✅ 綁定完成：您是「{member}」，將收到由對方設定的提醒。"
+                ))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(
+                    text="⚠️ 找不到對應的家人資料，請請對方確認已新增『{member}』。"
+                ))
+        except Exception as e:
+            app.logger.error(f"[confirm_relationship] 錯誤：{e}")
+            traceback.print_exc()
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text="❌ 綁定失敗，請稍後再試。"
+            ))
+        finally:
+            if conn and conn.is_connected():
+                conn.close()
+
     elif action == "confirm_unbind":
         target_user_id = params.get("target")
         if not target_user_id:
