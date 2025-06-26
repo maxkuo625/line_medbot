@@ -335,6 +335,45 @@ def handle_message(event):
         set_temp_state(line_user_id, {"state": "AWAITING_MEDICINE_NAME", "member": current_state_info.get("member")})
         reply_message(reply_token, TextSendMessage(text="請輸入藥品名稱："))
 
+    elif state == "AWAITING_CUSTOM_RELATIONSHIP_INPUT":
+        inviter_id = current_state_info.get("inviter_id")
+        member = message_text.strip()
+
+        if not member:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的關係名稱。"))
+            return
+
+        try:
+            conn = get_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM patients WHERE recorder_id = %s AND member = %s", (inviter_id, member))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("INSERT INTO patients (recorder_id, member, linked_user_id) VALUES (%s, %s, %s)",
+                            (inviter_id, member, line_user_id))
+            else:
+                cursor.execute("UPDATE patients SET linked_user_id = %s WHERE recorder_id = %s AND member = %s",
+                            (line_user_id, inviter_id, member))
+
+            conn.commit()
+
+            # 通知被邀請人
+            line_bot_api.reply_message(reply_token, TextSendMessage(
+                text=f"✅ 綁定完成：您是「{member}」，將收到由對方設定的提醒。"
+            ))
+
+            # 通知邀請人
+            line_bot_api.push_message(inviter_id, TextSendMessage(
+                text=f"📢 已成功將 LINE 使用者 {line_user_id[-6:]} 綁定為「{member}」"
+            ))
+
+        except Exception as e:
+            app.logger.error(f"[custom_relationship_input] 錯誤：{e}")
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="❌ 綁定失敗，請稍後再試。"))
+        finally:
+            if conn and conn.is_connected():
+                conn.close()
+            clear_temp_state(line_user_id)
+
     # ✅ 使用者輸入藥品名稱
     elif state == "AWAITING_MEDICINE_NAME":
         medicine_name = message_text
@@ -535,6 +574,15 @@ def handle_postback_event(event):
                             for m in members
                         ]
 
+                        quick_buttons.append(
+                            QuickReplyButton(
+                                action=PostbackAction(
+                                    label="⊕ 新增其他關係",
+                                    data=f"action=input_custom_relationship&inviter_id={inviter_id}"
+                                )
+                            )
+                        )
+
                         line_bot_api.push_message(line_user_id, TextSendMessage(
                             text="📌 這位邀請你的人跟你是什麼關係？",
                             quick_reply=QuickReply(items=quick_buttons)
@@ -551,6 +599,15 @@ def handle_postback_event(event):
             line_bot_api.reply_message(reply_token, TextSendMessage(
                 text="❌ 綁定失敗，邀請碼無效或已使用或過期。"
             ))
+
+    elif action == "input_custom_relationship":
+        inviter_id = params.get("inviter_id")
+        set_temp_state(line_user_id, {
+            "state": "AWAITING_CUSTOM_RELATIONSHIP_INPUT",
+            "inviter_id": inviter_id
+        })
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入這位邀請你的人與你的關係，例如：阿嬤、叔叔、姊姊…"))
+
 
     elif action == "confirm_relationship":
         inviter_id = params.get("inviter_id")
